@@ -24,10 +24,10 @@ import (
 func TestHealthCheckHandler(t *testing.T) {
 	// HTTPHandler is implementation to handle HTTP API exposed by server
 	healthyHandler := HTTPHandler{
-		Status: http.StatusOK,
+		Health: http.StatusOK,
 	}
 	unhealthyHandler := HTTPHandler{
-		Status: http.StatusInternalServerError,
+		Health: http.StatusInternalServerError,
 	}
 	if err := healthCheckTest(healthyHandler.serveHealthz, http.StatusOK, true); err != nil {
 		t.Fatal(err)

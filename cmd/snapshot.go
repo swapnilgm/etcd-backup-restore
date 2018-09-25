@@ -48,26 +48,18 @@ storing snapshots on various cloud storage providers as well as local disk locat
 				insecureTransport,
 				insecureSkipVerify,
 				etcdEndpoints)
-			ssr, err := snapshotter.NewSnapshotter(
-				schedule,
-				ss,
-				logger,
-				maxBackups,
-				deltaSnapshotIntervalSeconds,
-				time.Duration(etcdConnectionTimeout),
-				time.Duration(garbageCollectionPeriodSeconds),
-				garbageCollectionPolicy,
-				tlsConfig)
+			ssrConfig, err := snapshotter.NewSnapshotterConfig(schedule, ss, maxBackups, deltaSnapshotIntervalSeconds, time.Duration(etcdConnectionTimeout), time.Duration(garbageCollectionPeriodSeconds), garbageCollectionPolicy, tlsConfig)
 			if err != nil {
-				logger.Fatalf("Failed to create snapshotter: %v", err)
+				logger.Fatalf("Failed to create snapshotter config from given parameters: %v", err)
 			}
-			gcStopCh := make(chan bool)
-			go ssr.GarbageCollector(gcStopCh)
+			ssr := snapshotter.NewSnapshotter(ssrConfig, logger)
+			gcStopCh := make(chan struct{})
+			go ssr.RunGarbageCollector(stopCh)
 			if err := ssr.Run(false, stopCh); err != nil {
 				logger.Fatalf("Snapshotter failed with error: %v", err)
 			}
-			gcStopCh <- true
 			logger.Info("Shutting down...")
+			close(gcStopCh)
 			return
 		},
 	}

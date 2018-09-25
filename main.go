@@ -50,6 +50,7 @@ func setupSignalHandler() <-chan struct{} {
 	signal.Notify(c, shutdownSignals...)
 	go func() {
 		<-c
+		fmt.Printf("Received stop signal")
 		close(stop)
 		<-c
 		os.Exit(1) // second signal. Exit directly.

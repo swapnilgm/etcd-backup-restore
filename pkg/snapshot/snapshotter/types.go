@@ -29,25 +29,37 @@ const (
 	GarbageCollectionPolicyExponential = "Exponential"
 	// GarbageCollectionPolicyLimitBased defines the limit based policy for garbage collecting old backups
 	GarbageCollectionPolicyLimitBased = "LimitBased"
+
+	// SnapshotterStateInactive indicates that snapshotter is currently not running.
+	SnapshotterStateInactive uint32 = 0
+	// SnapshotterStateActive indicates that snapshotter is currently running.
+	SnapshotterStateActive uint32 = 1
 )
 
 // Snapshotter is a struct for etcd snapshot taker
 type Snapshotter struct {
-	logger                         *logrus.Logger
+	config              *Config
+	logger              *logrus.Logger
+	prevSnapshot        *snapstore.Snapshot
+	wg                  sync.WaitGroup
+	garbageCollectionWg sync.WaitGroup
+	fullSnapshotCh      chan struct{}
+	deltaStopCh         chan struct{}
+	StateMutex          sync.Mutex
+	State               uint32
+	fullSnapshotTimer   *time.Timer
+}
+
+// Config stores the configuration parameters for the snapshotter.
+type Config struct {
 	schedule                       cron.Schedule
 	store                          snapstore.SnapStore
 	maxBackups                     int
+	deltaSnapshotIntervalSeconds   int
 	etcdConnectionTimeout          time.Duration
 	garbageCollectionPeriodSeconds time.Duration
 	garbageCollectionPolicy        string
 	tlsConfig                      *TLSConfig
-	deltaSnapshotIntervalSeconds   int
-	deltaEventCount                int
-	prevSnapshot                   *snapstore.Snapshot
-	wg                             *sync.WaitGroup
-	fullSnapshotCh                 chan time.Time
-	deltaStopCh                    chan bool
-	isWatchActive                  bool
 }
 
 // TLSConfig holds cert information and settings for TLS.

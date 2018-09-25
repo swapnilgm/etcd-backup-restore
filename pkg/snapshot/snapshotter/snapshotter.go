@@ -34,40 +34,42 @@ import (
 )
 
 // NewSnapshotter returns the snapshotter object.
-func NewSnapshotter(schedule string, store snapstore.SnapStore, logger *logrus.Logger, maxBackups, deltaSnapshotIntervalSeconds int, etcdConnectionTimeout, garbageCollectionPeriodSeconds time.Duration, garbageCollectionPolicy string, tlsConfig *TLSConfig) (*Snapshotter, error) {
-	logger.Printf("Validating schedule...")
+func NewSnapshotter(config *Config, logger *logrus.Logger) *Snapshotter {
+	// Create dummy previous snapshot
+	prevSnapshot := snapstore.NewSnapshot(snapstore.SnapshotKindFull, 0, 0)
+	return &Snapshotter{
+		logger:         logger,
+		config:         config,
+		prevSnapshot:   prevSnapshot,
+		wg:             sync.WaitGroup{},
+		fullSnapshotCh: make(chan struct{}),
+		deltaStopCh:    make(chan struct{}),
+		State:          SnapshotterStateInactive,
+	}
+}
+
+// NewSnapshotterConfig returns a config for the snapshotter.
+func NewSnapshotterConfig(schedule string, store snapstore.SnapStore, maxBackups, deltaSnapshotIntervalSeconds int, etcdConnectionTimeout, garbageCollectionPeriodSeconds time.Duration, garbageCollectionPolicy string, tlsConfig *TLSConfig) (*Config, error) {
+	logrus.Info("Validating schedule...")
 	sdl, err := cron.ParseStandard(schedule)
 	if err != nil {
 		return nil, fmt.Errorf("invalid schedule provied %s : %v", schedule, err)
 	}
-	if maxBackups < 1 {
+	logrus.Infof("Schedule: %v", schedule)
+
+	if garbageCollectionPolicy == GarbageCollectionPolicyLimitBased && maxBackups < 1 {
 		return nil, fmt.Errorf("maximum backups limit should be greater than zero. Input MaxBackups: %d", maxBackups)
 	}
 
-	// Create dummy previous snapshot
-	prevSnapshot := &snapstore.Snapshot{
-		Kind:          snapstore.SnapshotKindFull,
-		StartRevision: 0,
-		LastRevision:  0,
-		CreatedOn:     time.Now().UTC(),
-	}
-	prevSnapshot.GenerateSnapshotDirectory()
-	prevSnapshot.GenerateSnapshotName()
-
-	return &Snapshotter{
-		logger:                         logger,
-		schedule:                       sdl,
-		store:                          store,
-		maxBackups:                     maxBackups,
+	return &Config{
+		schedule: sdl,
+		store:    store,
+		deltaSnapshotIntervalSeconds:   deltaSnapshotIntervalSeconds,
 		etcdConnectionTimeout:          etcdConnectionTimeout,
 		garbageCollectionPeriodSeconds: garbageCollectionPeriodSeconds,
 		garbageCollectionPolicy:        garbageCollectionPolicy,
+		maxBackups:                     maxBackups,
 		tlsConfig:                      tlsConfig,
-		deltaSnapshotIntervalSeconds:   deltaSnapshotIntervalSeconds,
-		prevSnapshot:                   prevSnapshot,
-		wg:                             &sync.WaitGroup{},
-		fullSnapshotCh:                 make(chan time.Time),
-		deltaStopCh:                    make(chan bool),
 	}, nil
 }
 
@@ -86,13 +88,12 @@ func NewTLSConfig(cert, key, caCert string, insecureTr, skipVerify bool, endpoin
 // Run process loop for scheduled backup
 func (ssr *Snapshotter) Run(skipInitialFullSnapshot bool, stopCh <-chan struct{}) error {
 	var (
-		now               = time.Now()
-		effective         = ssr.schedule.Next(now)
-		fullSnapshotTimer = time.NewTimer(effective.Sub(now))
+		now       = time.Now()
+		effective = ssr.config.schedule.Next(now)
 	)
 
 	if effective.IsZero() {
-		ssr.logger.Infoln("There are no backup scheduled for future. Stopping now.")
+		ssr.logger.Info("There are no backup scheduled for future. Stopping now.")
 		close(ssr.fullSnapshotCh)
 		return nil
 	}
@@ -103,34 +104,30 @@ func (ssr *Snapshotter) Run(skipInitialFullSnapshot bool, stopCh <-chan struct{}
 		}
 	}
 
+	ssr.fullSnapshotTimer = time.AfterFunc(effective.Sub(now), ssr.handleFullSnapshotTimer)
 	if err := ssr.applyWatch(); err != nil {
 		return err
 	}
 
-	// Add event based on full snapshot period
-	go func(stopCh <-chan struct{}) {
-		for {
-			select {
-			case tempTime := <-fullSnapshotTimer.C:
-				ssr.fullSnapshotCh <- tempTime
-			case <-stopCh:
-				fullSnapshotTimer.Stop()
-				return
-			}
-		}
-	}(stopCh)
+	ssr.StateMutex.Lock()
+	ssr.State = SnapshotterStateActive
+	ssr.StateMutex.Unlock()
 
+	// Add event based on full snapshot period
 	ssr.logger.Infof("Will take next full snapshot at time: %s", effective)
 	for {
 		select {
 		case <-stopCh:
-			ssr.logger.Infof("Stop signal received. Terminating scheduled snapshot.")
-			close(ssr.fullSnapshotCh)
-			close(ssr.deltaStopCh)
+			ssr.stop()
 			return nil
 
-		case <-ssr.fullSnapshotCh:
-			ssr.deltaStopCh <- true
+		case _, ok := <-ssr.fullSnapshotCh:
+			if !ok {
+				return nil
+			}
+			ssr.fullSnapshotTimer.Stop()
+			var emptyStruct struct{}
+			ssr.deltaStopCh <- emptyStruct
 			ssr.wg.Wait()
 			ssr.logger.Infof("Taking scheduled snapshot for time: %s", time.Now().Local())
 			if err := ssr.TakeFullSnapshot(); err != nil {
@@ -140,46 +137,65 @@ func (ssr *Snapshotter) Run(skipInitialFullSnapshot bool, stopCh <-chan struct{}
 			}
 
 			now = time.Now()
-			effective = ssr.schedule.Next(now)
+			effective = ssr.config.schedule.Next(now)
 			if effective.IsZero() {
-				ssr.logger.Infoln("There are no backup scheduled for future. Stopping now.")
+				ssr.logger.Info("There are no backup scheduled for future. Stopping now.")
 				return nil
 			}
-			fullSnapshotTimer.Stop()
-			fullSnapshotTimer.Reset(effective.Sub(now))
+			ssr.fullSnapshotTimer = time.AfterFunc(effective.Sub(now), ssr.handleFullSnapshotTimer)
 			ssr.logger.Infof("Will take next full snapshot at time: %s", effective)
 			if err := ssr.applyWatch(); err != nil {
 				return err
 			}
 		}
-
 	}
+}
+
+func (ssr *Snapshotter) handleFullSnapshotTimer() {
+	var emptyStruct struct{}
+	logrus.Infof("Timer before  %s", time.Now().String())
+	ssr.fullSnapshotCh <- emptyStruct
+	logrus.Infof("Timer after %s", time.Now().String())
+}
+
+// stop stops the Snapshotter
+func (ssr *Snapshotter) stop() {
+	ssr.logger.Infof("Stop signal received. Terminating scheduled snapshot...")
+	ssr.StateMutex.Lock()
+	ssr.State = SnapshotterStateInactive
+	if ssr.fullSnapshotTimer != nil {
+		ssr.fullSnapshotTimer.Stop()
+	}
+	var emptyStruct struct{}
+	ssr.deltaStopCh <- emptyStruct
+	ssr.wg.Wait()
+	ssr.StateMutex.Unlock()
 }
 
 // TakeFullSnapshot will store full snapshot of etcd to snapstore.
 // It basically will connect to etcd. Then ask for snapshot. And finally
 // store it to underlying snapstore on the fly.
 func (ssr *Snapshotter) TakeFullSnapshot() error {
-	client, err := GetTLSClientForEtcd(ssr.tlsConfig)
+	client, err := GetTLSClientForEtcd(ssr.config.tlsConfig)
 	if err != nil {
 		return &errors.EtcdError{
 			Message: fmt.Sprintf("failed to create etcd client: %v", err),
 		}
 	}
 
-	ctx, cancel := context.WithTimeout(context.TODO(), ssr.etcdConnectionTimeout*time.Second)
+	ctx, cancel := context.WithTimeout(context.TODO(), ssr.config.etcdConnectionTimeout*time.Second)
+	defer cancel()
 	// Note: Although Get and snapshot call are not atomic, so revision number in snapshot file
 	// may be ahead of the revision found from GET call. But currently this is the only workaround available
 	// Refer: https://github.com/coreos/etcd/issues/9037
 	resp, err := client.Get(ctx, "", clientv3.WithLastRev()...)
-	cancel()
 	if err != nil {
 		return &errors.EtcdError{
 			Message: fmt.Sprintf("failed to get etcd latest revision: %v", err),
 		}
 	}
 	lastRevision := resp.Header.Revision
-	ctx, cancel = context.WithTimeout(context.TODO(), ssr.etcdConnectionTimeout*time.Second)
+	ctx, cancel = context.WithTimeout(context.TODO(), ssr.config.etcdConnectionTimeout*time.Second)
 	defer cancel()
 	rc, err := client.Snapshot(ctx)
 	if err != nil {
@@ -188,16 +204,9 @@ func (ssr *Snapshotter) TakeFullSnapshot() error {
 		}
 	}
 	ssr.logger.Infof("Successfully opened snapshot reader on etcd")
-	s := &snapstore.Snapshot{
-		Kind:          snapstore.SnapshotKindFull,
-		CreatedOn:     time.Now().UTC(),
-		StartRevision: 0,
-		LastRevision:  lastRevision,
-	}
-	s.GenerateSnapshotDirectory()
-	s.GenerateSnapshotName()
+	s := snapstore.NewSnapshot(snapstore.SnapshotKindFull, 0, lastRevision)
 	startTime := time.Now()
-	if err := ssr.store.Save(*s, rc); err != nil {
+	if err := ssr.config.store.Save(*s, rc); err != nil {
 		return &errors.SnapstoreError{
 			Message: fmt.Sprintf("failed to save snapshot: %v", err),
 		}
@@ -258,7 +267,7 @@ func GetTLSClientForEtcd(tlsConfig *TLSConfig) (*clientv3.Client, error) {
 
 // applyWatch applies the new watch on etcd and start go routine to periodically take delta snapshots
 func (ssr *Snapshotter) applyWatch() error {
-	client, err := GetTLSClientForEtcd(ssr.tlsConfig)
+	client, err := GetTLSClientForEtcd(ssr.config.tlsConfig)
 	if err != nil {
 		return &errors.EtcdError{
 			Message: fmt.Sprintf("failed to create etcd client: %v", err),
@@ -272,11 +281,12 @@ func (ssr *Snapshotter) applyWatch() error {
 // processWatch processess watch to take delta snapshot periodically by collecting set of events within period
 func (ssr *Snapshotter) processWatch(client *clientv3.Client) {
 	var (
-		ctx        = context.TODO()
-		watchCh    = client.Watch(ctx, "", clientv3.WithPrefix(), clientv3.WithRev(ssr.prevSnapshot.LastRevision+1))
-		currentRev int64
-		events     = []*event{}
-		timer      = time.NewTimer(time.Second * time.Duration(ssr.deltaSnapshotIntervalSeconds))
+		currentRev  int64
+		emptyStruct struct{}
+		ctx         = context.TODO()
+		watchCh     = client.Watch(ctx, "", clientv3.WithPrefix(), clientv3.WithRev(ssr.prevSnapshot.LastRevision+1))
+		events      = []*event{}
+		timer       = time.NewTimer(time.Second * time.Duration(ssr.config.deltaSnapshotIntervalSeconds))
 	)
 	ssr.logger.Infof("Applied watch on etcd from revision: %08d", ssr.prevSnapshot.LastRevision+1)
 	defer ssr.wg.Done()
@@ -284,18 +294,29 @@ func (ssr *Snapshotter) processWatch(client *clientv3.Client) {
 	for {
 		select {
 		case <-ssr.deltaStopCh:
-			ssr.logger.Infoln("Received stop signal. Terminating watch and Saving aggregated events if any...")
+			ssr.logger.Info("Received stop signal. Terminating watch and Saving aggregated events if any...")
+			//persist aggregated events
+			if len(events) != 0 {
+				if err := ssr.saveDeltaSnapshot(events, currentRev); err != nil {
+					ssr.logger.Errorf("failed to take new delta snapshot: %s", err)
+					return
+				}
+				events = []*event{}
+			} else {
+				ssr.logger.Infof("No events received to save snapshot.")
+			}
+			timer.Stop()
 			return
 
 		case wr, ok := <-watchCh:
 			if !ok {
-				ssr.logger.Warnln("watch channel closed")
-				ssr.fullSnapshotCh <- time.Now()
+				ssr.logger.Warn("watch channel closed")
+				ssr.fullSnapshotCh <- emptyStruct
 				return
 			}
 			if err := wr.Err(); err != nil {
-				ssr.logger.Warnln("watch channel responded with err: %v", err)
-				ssr.fullSnapshotCh <- time.Now()
+				ssr.logger.Warn("watch channel responded with err: %v", err)
+				ssr.fullSnapshotCh <- emptyStruct
 				return
 			}
 
@@ -310,14 +331,15 @@ func (ssr *Snapshotter) processWatch(client *clientv3.Client) {
 			if len(events) != 0 {
 				if err := ssr.saveDeltaSnapshot(events, currentRev); err != nil {
 					ssr.logger.Errorf("failed to take new delta snapshot: %s", err)
-					ssr.fullSnapshotCh <- time.Now()
+					ssr.fullSnapshotCh <- emptyStruct
+					timer.Stop()
 					return
 				}
 				events = []*event{}
 			} else {
 				ssr.logger.Infof("No events received to save snapshot.")
 			}
-			timer.Reset(time.Second * time.Duration(ssr.deltaSnapshotIntervalSeconds))
+			timer.Reset(time.Second * time.Duration(ssr.config.deltaSnapshotIntervalSeconds))
 		}
 	}
 }
@@ -345,7 +367,7 @@ func (ssr *Snapshotter) saveDeltaSnapshot(ops []*event, lastRevision int64) erro
 
 	dataReader := bytes.NewReader(data)
 
-	if err := ssr.store.Save(*snap, dataReader); err != nil {
+	if err := ssr.config.store.Save(*snap, dataReader); err != nil {
 		return &errors.SnapstoreError{
 			Message: fmt.Sprintf("failed to save snapshot: %v", err),
 		}

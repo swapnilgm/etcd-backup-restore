@@ -23,6 +23,9 @@ const (
 	defaultServerPort               = 8080
 	defaultName                     = "default"
 	defaultInitialAdvertisePeerURLs = "http://localhost:2380"
+
+	ssrStateInactive uint32 = 0
+	ssrStateActive   uint32 = 1
 )
 
 var (

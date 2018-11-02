@@ -15,6 +15,7 @@
 package snapshotter
 
 import (
+	"context"
 	"sync"
 	"time"
 
@@ -43,11 +44,12 @@ type Snapshotter struct {
 	prevSnapshot        *snapstore.Snapshot
 	wg                  sync.WaitGroup
 	garbageCollectionWg sync.WaitGroup
-	fullSnapshotCh      chan struct{}
-	deltaStopCh         chan struct{}
+	fullSnapshotTimer   *time.Timer
+	deltaStopTimer      *time.Timer
 	StateMutex          sync.Mutex
 	State               uint32
-	fullSnapshotTimer   *time.Timer
+	watchCh             clientv3.WatchChan
+	cancelWatch         context.CancelFunc
 }
 
 // Config stores the configuration parameters for the snapshotter.

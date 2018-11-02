@@ -144,6 +144,10 @@ func NewServerCommand(stopCh <-chan struct{}) *cobra.Command {
 					handler.Health = http.StatusOK
 				}
 
+				ssr.StateMutex.Lock()
+				ssr.State = snapshotter.SnapshotterStateActive
+				ssr.StateMutex.Unlock()
+
 				gcStopCh := make(chan struct{})
 				go ssr.RunGarbageCollector(gcStopCh)
 
@@ -204,23 +208,20 @@ func ProbeEtcd(tlsConfig *snapshotter.TLSConfig) error {
 // handleSsrRequest act to handler request or stop interrupt.
 func handleSsrRequest(handler *server.HTTPHandler, ssr *snapshotter.Snapshotter, ssrStopCh chan<- struct{}, stopCh <-chan struct{}) {
 	for {
-		var s struct{}
 		select {
 		case handlerReq := <-handler.ReqCh:
 			ssr.StateMutex.Lock()
-			if handlerReq == server.HandlerSsrAbort {
-				if ssr.State == snapshotter.SnapshotterStateActive {
-					ssrStopCh <- s
-					logger.Infof("Sent stop signal to snapshotter.")
-				} else {
-					handler.AckCh <- s
-				}
+			if ssr.State == snapshotter.SnapshotterStateActive {
+				ssrStopCh <- emptyStruct
+				logger.Infof("Sent stop signal to snapshotter.")
+			} else {
+				handler.AckCh <- emptyStruct
 			}
 			ssr.StateMutex.Unlock()
 
 		case <-stopCh:
 			ssr.StateMutex.Lock()
-			logger.Infof("Received stop signal. Terminating !!")
+			logger.Infof("Received stop signal from system. Terminating !!")
 			if ssr.State == snapshotter.SnapshotterStateActive {
 				ssrStopCh <- s
 			}
@@ -233,10 +234,9 @@ func handleSsrRequest(handler *server.HTTPHandler, ssr *snapshotter.Snapshotter,
 // handleNoSsrRequest responds to handler snapshotter stop request with acknowledgment when snapshotter is not running.
 func handleNoSsrRequest(handler *server.HTTPHandler) {
 	for {
-		var s struct{}
-		handlerReq := <-handler.ReqCh
-		if handlerReq == server.HandlerSsrAbort && atomic.CompareAndSwapUint32(&handler.AckState, server.HandlerAckWaiting, server.HandlerAckDone) {
-			handler.AckCh <- s
+		<-handler.ReqCh
+		if atomic.CompareAndSwapUint32(&handler.AckState, server.HandlerAckWaiting, server.HandlerAckDone) {
+			handler.AckCh <- emptyStruct
 		}
 	}
 }

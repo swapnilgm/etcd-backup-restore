@@ -29,7 +29,8 @@ const (
 )
 
 var (
-	logger = logrus.New()
+	logger      = logrus.New()
+	emptyStruct struct{}
 
 	//snapshotter flags
 	schedule                       string

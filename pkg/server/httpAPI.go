@@ -42,16 +42,6 @@ const (
 	HandlerAckWaiting uint32 = 1
 )
 
-// HandlerRequest represents the type of request handler makes to the snapshotter.
-type HandlerRequest int
-
-const (
-	// HandlerSsrAbort is the HandlerRequest to the snapshotter to terminate the snapshot process.
-	HandlerSsrAbort HandlerRequest = 0
-	// HandlerSsrStart is the HandlerRequest to the snapshotter to start the snapshot process.
-	HandlerSsrStart HandlerRequest = 1
-)
-
 // HTTPHandler is implementation to handle HTTP API exposed by server
 type HTTPHandler struct {
 	Port   int
@@ -64,7 +54,7 @@ type HTTPHandler struct {
 	EnableProfiling           bool
 	Health                    int
 	AckState                  uint32
-	ReqCh                     chan HandlerRequest
+	ReqCh                     chan struct{}
 	AckCh                     chan struct{}
 }
 
@@ -136,7 +126,8 @@ func (h *HTTPHandler) serveInitialize(rw http.ResponseWriter, req *http.Request)
 			// This is needed to stop snapshotter.
 			atomic.StoreUint32(&h.AckState, HandlerAckWaiting)
 			h.Logger.Info("Changed handler state to waiting for acknowledgment.")
-			h.ReqCh <- HandlerSsrAbort
+			var emptyStruct struct{}
+			h.ReqCh <- emptyStruct
 			h.Logger.Info("Abort signal sent to snapshotter.")
 			<-h.AckCh
 			h.Logger.Info("Received acknowledgment from snapshotter.")
@@ -151,8 +142,6 @@ func (h *HTTPHandler) serveInitialize(rw http.ResponseWriter, req *http.Request)
 			}
 			h.Logger.Infof("Successfully initialized data directory \"%s\" for etcd.", h.EtcdInitializer.Validator.Config.DataDir)
 			h.initializationStatus = initializationStatusSuccessful
-
-			h.ReqCh <- HandlerSsrStart
 		}()
 	}
 	rw.WriteHeader(http.StatusOK)

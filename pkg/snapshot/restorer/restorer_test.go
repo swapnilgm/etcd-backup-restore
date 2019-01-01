@@ -102,31 +102,32 @@ var _ = Describe("Running Restorer", func() {
 		})
 	})
 
-	Context("with maximum of one fetcher allowed", func() {
-		fmt.Println("Testing for max-fetchers=1")
-		It("should restore etcd data directory", func() {
-			maxFetchers = 1
+	/*
+		Context("with maximum of one fetcher allowed", func() {
+			fmt.Println("Testing for max-fetchers=1")
+			It("should restore etcd data directory", func() {
+				maxFetchers = 1
 
-			restoreOptions := RestoreOptions{
-				ClusterURLs:    clusterUrlsMap,
-				ClusterToken:   restoreClusterToken,
-				RestoreDataDir: restoreDataDir,
-				PeerURLs:       peerUrls,
-				SkipHashCheck:  skipHashCheck,
-				Name:           restoreName,
-				MaxFetchers:    maxFetchers,
-				BaseSnapshot:   *baseSnapshot,
-				DeltaSnapList:  deltaSnapList,
-			}
-			err = rstr.Restore(restoreOptions)
-			Expect(err).ShouldNot(HaveOccurred())
+				restoreOptions := RestoreOptions{
+					ClusterURLs:    clusterUrlsMap,
+					ClusterToken:   restoreClusterToken,
+					RestoreDataDir: restoreDataDir,
+					PeerURLs:       peerUrls,
+					SkipHashCheck:  skipHashCheck,
+					Name:           restoreName,
+					MaxFetchers:    maxFetchers,
+					BaseSnapshot:   *baseSnapshot,
+					DeltaSnapList:  deltaSnapList,
+				}
+				err = rstr.Restore(restoreOptions)
+				Expect(err).ShouldNot(HaveOccurred())
 
-			err = checkDataConsistency(restoreDataDir, logger)
-			Expect(err).ShouldNot(HaveOccurred())
+				err = checkDataConsistency(restoreDataDir, logger)
+				Expect(err).ShouldNot(HaveOccurred())
+			})
 		})
-	})
-
-	Context("with maximum of four fetchers allowed", func() {
+	*/
+	/*Context("with maximum of four fetchers allowed", func() {
 		fmt.Println("Testing for max-fetchers=4")
 		It("should restore etcd data directory", func() {
 			maxFetchers = 4
@@ -148,7 +149,7 @@ var _ = Describe("Running Restorer", func() {
 			err = checkDataConsistency(restoreDataDir, logger)
 			Expect(err).ShouldNot(HaveOccurred())
 		})
-	})
+	})*/
 
 	Context("with maximum of hundred fetchers allowed", func() {
 		fmt.Println("Testing for max-fetchers=100")

@@ -3,6 +3,7 @@
 [![CI Build status](https://concourse.ci.infra.gardener.cloud/api/v1/teams/gardener/pipelines/etcd-backup-restore-master/jobs/master-head-update-job/badge)](https://concourse.ci.infra.gardener.cloud/teams/gardener/pipelines/etcd-backup-restore-master/jobs/master-head-update-job)
 [![Go Report Card](https://goreportcard.com/badge/github.com/gardener/etcd-backup-restore)](https://goreportcard.com/report/github.com/gardener/etcd-backup-restore)
 [![GoDoc](https://godoc.org/github.com/gardener/etcd-backup-restore?status.svg)](https://godoc.org/github.com/gardener/etcd-backup-restore)
+[![Coverage Status](https://coveralls.io/repos/github/swapnilgm/etcd-backup-restore/badge.svg?branch=master)](https://coveralls.io/github/swapnilgm/etcd-backup-restore?branch=master)
 
 Etcd-backup-restore is collection of components to backup and restore the [etcd]. It also, provides the ability to validate the data directory, so that we could know the data directory is in good shape to bootstrap etcd successfully.
 
@@ -99,7 +100,7 @@ git clone https://github.com/gardener/etcd-backup-restore.git
 cd etcd-backup-restore
 ```
 
-To build the binary in local machine environment, use `make` target `build-local`. 
+To build the binary in local machine environment, use `make` target `build-local`.
 
 ```sh
 make build-local
@@ -119,7 +120,7 @@ You can follow the `help` flag on `etcdbrctl` command and its sub-commands to kn
 
 ### Cloud Provider Credentials
 
-The procedure to provide credentials to access the cloud provider object store varies for different providers. 
+The procedure to provide credentials to access the cloud provider object store varies for different providers.
 
 For `AWS S3`, the `credentials` file has to be provided in the `~/.aws` directory.
 
@@ -133,7 +134,7 @@ For `Openstack Swift`, `OS_USERNAME`, `OS_PASSWORD`, `OS_AUTH_URL`, `OS_TENANT_I
 
 
 
-`etcd` should already be running. One can apply standard cron format scheduling for regular backup of etcd. The cron schedule is used to take full backups. The delta snapshots are taken at regular intervals in the period in between full snapshots as indicated by the `delta-snapshot-period-seconds` flag. The default for the same is 10 seconds. 
+`etcd` should already be running. One can apply standard cron format scheduling for regular backup of etcd. The cron schedule is used to take full backups. The delta snapshots are taken at regular intervals in the period in between full snapshots as indicated by the `delta-snapshot-period-seconds` flag. The default for the same is 10 seconds.
 
 etcd-backup-restore has two garbage collection policies to collect existing backups from the cloud bucket. The flag `garbage-collection-policy` is used to indicate the correct garbage collection policy.
 1. `Exponential`
@@ -153,7 +154,7 @@ INFO[0000] Applied watch on etcd from revision: 00000002
 INFO[0000] No events received to save snapshot.
 ```
 
-The command mentioned above takes hourly snapshots and pushs it to S3 bucket named "etcd-backup". It is configured to keep only last 10 backups in bucket. 
+The command mentioned above takes hourly snapshots and pushs it to S3 bucket named "etcd-backup". It is configured to keep only last 10 backups in bucket.
 
 `Exponential` policy stores the snapshots in a condensed manner as mentioned below:
 - All full backups and delta backups for the previous hour.
@@ -173,7 +174,7 @@ INFO[0000] Applied watch on etcd from revision: 00000002
 INFO[0000] No events received to save snapshot.
 ```
 
-The command mentioned above stores etcd snapshots as per the exponential policy mentioned above. 
+The command mentioned above stores etcd snapshots as per the exponential policy mentioned above.
 
 ### Etcd data directory initialization
 

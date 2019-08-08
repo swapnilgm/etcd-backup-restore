@@ -38,14 +38,14 @@ const (
 
 var emptyStruct struct{}
 
-// HandlerAckState denotes the state the handler would be in after sending a stop request to the snapshotter.
-type HandlerAckState int32
+// handlerAckState denotes the state the handler would be in after sending a stop request to the snapshotter.
+type handlerAckState int32
 
 const (
 	// HandlerAckDone is set when handler has been acknowledged of snapshotter termination.
-	HandlerAckDone uint32 = 0
+	handlerAckDone uint32 = 0
 	// HandlerAckWaiting is set when handler starts waiting of snapshotter termination.
-	HandlerAckWaiting uint32 = 1
+	handlerAckWaiting uint32 = 1
 )
 
 // HandlerRequest represents the type of request handler makes to the snapshotter.
@@ -64,13 +64,12 @@ type HTTPHandler struct {
 	server                    *http.Server
 	Logger                    *logrus.Logger
 	initializationStatusMutex sync.Mutex
-	AckState                  uint32
 	initializationStatus      string
 	status                    int
-	StopCh                    chan struct{}
 	EnableProfiling           bool
 	ReqCh                     chan struct{}
 	AckCh                     chan struct{}
+	ackState                  uint32
 }
 
 // GetStatus returns the current status in the HTTPHandler
@@ -107,20 +106,6 @@ func (h *HTTPHandler) RegisterHandler() {
 	return
 }
 
-// registerPProfHandler registers the PProf handler for profiling.
-func registerPProfHandler(mux *http.ServeMux) {
-	mux.HandleFunc("/debug/pprof/", pprof.Index)
-	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
-	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
-	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
-	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
-	mux.HandleFunc("/debug/pprof/heap", pprof.Handler("heap").ServeHTTP)
-	mux.HandleFunc("/debug/pprof/goroutine", pprof.Handler("goroutine").ServeHTTP)
-	mux.HandleFunc("/debug/pprof/threadcreate", pprof.Handler("threadcreate").ServeHTTP)
-	mux.HandleFunc("/debug/pprof/block", pprof.Handler("block").ServeHTTP)
-	mux.HandleFunc("/debug/pprof/mutex", pprof.Handler("mutex").ServeHTTP)
-}
-
 // Start starts the http server to listen for request
 func (h *HTTPHandler) Start() {
 	h.Logger.Infof("Starting Http server at addr: %s", h.server.Addr)
@@ -154,11 +139,11 @@ func (h *HTTPHandler) serveInitialize(rw http.ResponseWriter, req *http.Request)
 		h.initializationStatus = initializationStatusProgress
 		go func() {
 			var mode validator.Mode
-
+			ctx := req.Context()
 			// This is needed to stop the currently running snapshotter.
 			if h.Snapshotter != nil {
-				atomic.StoreUint32(&h.AckState, HandlerAckWaiting)
-				h.Logger.Info("Changed handler state.")
+				atomic.StoreUint32(&h.ackState, handlerAckWaiting)
+				h.Logger.Info("Changed handler state to \"waiting\".")
 				h.ReqCh <- emptyStruct
 				h.Logger.Info("Waiting for acknowledgment...")
 				<-h.AckCh
@@ -187,7 +172,7 @@ func (h *HTTPHandler) serveInitialize(rw http.ResponseWriter, req *http.Request)
 				mode = validator.Full
 			}
 			h.Logger.Infof("Validation mode: %s", mode)
-			err := h.Initializer.Initialize(mode, failBelowRevision)
+			err := h.Initializer.Initialize(ctx, mode, failBelowRevision)
 			h.initializationStatusMutex.Lock()
 			defer h.initializationStatusMutex.Unlock()
 			if err != nil {
@@ -232,4 +217,26 @@ func (h *HTTPHandler) serveFullSnapshotTrigger(rw http.ResponseWriter, req *http
 		return
 	}
 	rw.WriteHeader(http.StatusOK)
+}
+
+// Acknowledge acknowledges handler to unblock it.
+func (h *HTTPHandler) Acknowledge() {
+	if atomic.CompareAndSwapUint32(&h.ackState, handlerAckWaiting, handlerAckDone) {
+		h.Logger.Info("Changed handler state to \"Done\".")
+		h.AckCh <- emptyStruct
+	}
+}
+
+// registerPProfHandler registers the PProf handler for profiling.
+func registerPProfHandler(mux *http.ServeMux) {
+	mux.HandleFunc("/debug/pprof/", pprof.Index)
+	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+	mux.HandleFunc("/debug/pprof/heap", pprof.Handler("heap").ServeHTTP)
+	mux.HandleFunc("/debug/pprof/goroutine", pprof.Handler("goroutine").ServeHTTP)
+	mux.HandleFunc("/debug/pprof/threadcreate", pprof.Handler("threadcreate").ServeHTTP)
+	mux.HandleFunc("/debug/pprof/block", pprof.Handler("block").ServeHTTP)
+	mux.HandleFunc("/debug/pprof/mutex", pprof.Handler("mutex").ServeHTTP)
 }

@@ -57,6 +57,9 @@ var _ = SynchronizedBeforeSuite(func() []byte {
 	err = os.RemoveAll(outputDir)
 	Expect(err).ShouldNot(HaveOccurred())
 
+	err = os.RemoveAll(etcdDir)
+	Expect(err).ShouldNot(HaveOccurred())
+
 	etcd, err = utils.StartEmbeddedEtcd(testCtx, etcdDir, logger)
 	Expect(err).ShouldNot(HaveOccurred())
 	defer func() {
@@ -75,7 +78,7 @@ var _ = SynchronizedBeforeSuite(func() []byte {
 	ctx, cancel := context.WithTimeout(testCtx, snapshotterTimeout)
 	defer cancel()
 	err = runSnapshotter(ctx, logger.Logger, deltaSnapshotPeriod, endpoints)
-	Expect(err).ShouldNot(HaveOccurred())
+	Expect(err).Should(Equal(context.DeadlineExceeded))
 	keyTo = resp.KeyTo
 	etcdRevision = resp.EndRevision
 
@@ -108,7 +111,7 @@ func runSnapshotter(ctx context.Context, logger *logrus.Logger, deltaSnapshotPer
 		etcdPassword                   string
 	)
 
-	store, err = snapstore.GetSnapstore(&snapstore.Config{Container: snapstoreDir, Provider: "Local"})
+	store, err = snapstore.GetSnapstore(ctx, &snapstore.Config{Container: snapstoreDir, Provider: "Local"})
 	if err != nil {
 		return err
 	}
@@ -140,11 +143,12 @@ func runSnapshotter(ctx context.Context, logger *logrus.Logger, deltaSnapshotPer
 	}
 
 	ssr := snapshotter.NewSnapshotter(
+		ctx,
 		logger,
 		snapshotterConfig,
 	)
 
-	return ssr.Run(ctx.Done(), true)
+	return ssr.Run(true)
 }
 
 // copyFile copies the contents of the file at sourceFilePath into the file at destinationFilePath. If no file exists at destinationFilePath, a new file is created before copying

@@ -16,6 +16,7 @@ package snapstore_test
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -40,7 +41,7 @@ type mockS3Client struct {
 }
 
 // GetObject returns the object from map for mock test
-func (m *mockS3Client) GetObject(in *s3.GetObjectInput) (*s3.GetObjectOutput, error) {
+func (m *mockS3Client) GetObjectWithContext(ctx context.Context, in *s3.GetObjectInput, _ ...request.Option) (*s3.GetObjectOutput, error) {
 	if m.objects[*in.Key] == nil {
 		return nil, fmt.Errorf("object not found")
 	}
@@ -52,7 +53,7 @@ func (m *mockS3Client) GetObject(in *s3.GetObjectInput) (*s3.GetObjectOutput, er
 }
 
 // PutObject adds the object to the map for mock test
-func (m *mockS3Client) PutObject(in *s3.PutObjectInput) (*s3.PutObjectOutput, error) {
+func (m *mockS3Client) PutObjectWithContext(ctx context.Context, in *s3.PutObjectInput, _ ...request.Option) (*s3.PutObjectOutput, error) {
 	size, err := in.Body.Seek(0, io.SeekEnd)
 	if err != nil {
 		return nil, fmt.Errorf("failed to seek at the end of body %v", err)
@@ -151,7 +152,7 @@ func (m *mockS3Client) AbortMultipartUploadWithContext(ctx aws.Context, in *s3.A
 }
 
 // ListObject returns the objects from map for mock test
-func (m *mockS3Client) ListObjects(in *s3.ListObjectsInput) (*s3.ListObjectsOutput, error) {
+func (m *mockS3Client) ListObjectsWithContext(ctx context.Context, in *s3.ListObjectsInput, _ ...request.Option) (*s3.ListObjectsOutput, error) {
 	var contents []*s3.Object
 	for key := range m.objects {
 		if strings.HasPrefix(key, *in.Prefix) {
@@ -171,7 +172,7 @@ func (m *mockS3Client) ListObjects(in *s3.ListObjectsInput) (*s3.ListObjectsOutp
 }
 
 // ListObject returns the objects from map for mock test
-func (m *mockS3Client) ListObjectsPages(in *s3.ListObjectsInput, callback func(*s3.ListObjectsOutput, bool) bool) error {
+func (m *mockS3Client) ListObjectsPagesWithContext(ctx context.Context, in *s3.ListObjectsInput, callback func(*s3.ListObjectsOutput, bool) bool, _ ...request.Option) error {
 	var (
 		count    int64 = 0
 		limit    int64 = 1 // aws default is 1000.
@@ -219,7 +220,7 @@ func (m *mockS3Client) ListObjectsPages(in *s3.ListObjectsInput, callback func(*
 }
 
 // DeleteObject deletes the object from map for mock test
-func (m *mockS3Client) DeleteObject(in *s3.DeleteObjectInput) (*s3.DeleteObjectOutput, error) {
+func (m *mockS3Client) DeleteObjectWithContext(ctx context.Context, in *s3.DeleteObjectInput, _ ...request.Option) (*s3.DeleteObjectOutput, error) {
 	delete(m.objects, *in.Key)
 	return &s3.DeleteObjectOutput{}, nil
 }

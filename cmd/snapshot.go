@@ -81,8 +81,8 @@ storing snapshots on various cloud storage providers as well as local disk locat
 			}
 			go etcdutil.DefragDataPeriodically(ctx, tlsConfig, defragSchedule, time.Duration(etcdConnectionTimeout)*time.Second, ssr.TriggerFullSnapshot, logrus.NewEntry(logger))
 
-			go ssr.RunGarbageCollector(ctx.Done())
-			if err := ssr.Run(ctx.Done(), true); err != nil {
+			go ssr.RunGarbageCollector(ctx)
+			if err := ssr.Run(ctx, true); err != nil {
 				logger.Fatalf("Snapshotter failed with error: %v", err)
 			}
 			logger.Info("Shutting down...")

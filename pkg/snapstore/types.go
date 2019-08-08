@@ -15,6 +15,7 @@
 package snapstore
 
 import (
+	"context"
 	"io"
 	"time"
 )
@@ -25,13 +26,13 @@ import (
 // access files.
 type SnapStore interface {
 	// Fetch should open reader for the snapshot file from store.
-	Fetch(Snapshot) (io.ReadCloser, error)
+	Fetch(context.Context, Snapshot) (io.ReadCloser, error)
 	// List will list all snapshot files on store.
-	List() (SnapList, error)
+	List(context.Context) (SnapList, error)
 	// Save will write the snapshot to store.
-	Save(Snapshot, io.ReadCloser) error
+	Save(context.Context, Snapshot, io.ReadCloser) error
 	// Delete should delete the snapshot file from store.
-	Delete(Snapshot) error
+	Delete(context.Context, Snapshot) error
 }
 
 const (

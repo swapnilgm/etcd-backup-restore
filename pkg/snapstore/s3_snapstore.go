@@ -79,8 +79,8 @@ func NewS3FromClient(bucket, prefix, tempDir string, maxParallelChunkUploads int
 }
 
 // Fetch should open reader for the snapshot file from store
-func (s *S3SnapStore) Fetch(snap Snapshot) (io.ReadCloser, error) {
-	resp, err := s.client.GetObject(&s3.GetObjectInput{
+func (s *S3SnapStore) Fetch(ctx context.Context, snap Snapshot) (io.ReadCloser, error) {
+	resp, err := s.client.GetObjectWithContext(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(path.Join(s.prefix, snap.SnapDir, snap.SnapName)),
 	})
@@ -91,7 +91,7 @@ func (s *S3SnapStore) Fetch(snap Snapshot) (io.ReadCloser, error) {
 }
 
 // Save will write the snapshot to store
-func (s *S3SnapStore) Save(snap Snapshot, rc io.ReadCloser) error {
+func (s *S3SnapStore) Save(ctx context.Context, snap Snapshot, rc io.ReadCloser) error {
 	tmpfile, err := ioutil.TempFile(s.tempDir, tmpBackupFilePrefix)
 	if err != nil {
 		rc.Close()
@@ -112,10 +112,10 @@ func (s *S3SnapStore) Save(snap Snapshot, rc io.ReadCloser) error {
 		return err
 	}
 	// Initiate multi part upload
-	ctx := context.TODO()
-	ctx, cancel := context.WithTimeout(ctx, chunkUploadTimeout)
+
+	chunkUploadCtx, cancel := context.WithTimeout(ctx, chunkUploadTimeout)
 	defer cancel()
-	uploadOutput, err := s.client.CreateMultipartUploadWithContext(ctx, &s3.CreateMultipartUploadInput{
+	uploadOutput, err := s.client.CreateMultipartUploadWithContext(chunkUploadCtx, &s3.CreateMultipartUploadInput{
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(path.Join(s.prefix, snap.SnapDir, snap.SnapName)),
 	})
@@ -136,12 +136,12 @@ func (s *S3SnapStore) Save(snap Snapshot, rc io.ReadCloser) error {
 		chunkUploadCh  = make(chan chunk, noOfChunks)
 		resCh          = make(chan chunkUploadResult, noOfChunks)
 		wg             sync.WaitGroup
-		cancelCh       = make(chan struct{})
 	)
+	chunkUploadCtx, cancelChunkUpload := context.WithCancel(ctx)
 
 	for i := 0; i < s.maxParallelChunkUploads; i++ {
 		wg.Add(1)
-		go s.partUploader(&wg, cancelCh, &snap, tmpfile, uploadOutput.UploadId, completedParts, chunkUploadCh, resCh)
+		go s.partUploader(chunkUploadCtx, &wg, &snap, tmpfile, uploadOutput.UploadId, completedParts, chunkUploadCh, resCh)
 	}
 	logrus.Infof("Uploading snapshot of size: %d, chunkSize: %d, noOfChunks: %d", size, chunkSize, noOfChunks)
 
@@ -156,25 +156,24 @@ func (s *S3SnapStore) Save(snap Snapshot, rc io.ReadCloser) error {
 		index++
 	}
 	logrus.Infof("Triggered chunk upload for all chunks, total: %d", noOfChunks)
-	snapshotErr := collectChunkUploadError(chunkUploadCh, resCh, cancelCh, noOfChunks)
+	snapshotErr := collectChunkUploadError(chunkUploadCtx, chunkUploadCh, resCh, cancelChunkUpload, noOfChunks)
 	wg.Wait()
 
 	if snapshotErr != nil {
-		ctx := context.TODO()
-		ctx, cancel := context.WithTimeout(ctx, chunkUploadTimeout)
+
+		chunkUploadCtx, cancel := context.WithTimeout(ctx, chunkUploadTimeout)
 		defer cancel()
 		logrus.Infof("Aborting the multipart upload with upload ID : %s", *uploadOutput.UploadId)
-		_, err = s.client.AbortMultipartUploadWithContext(ctx, &s3.AbortMultipartUploadInput{
+		_, err = s.client.AbortMultipartUploadWithContext(chunkUploadCtx, &s3.AbortMultipartUploadInput{
 			Bucket:   &s.bucket,
 			Key:      aws.String(path.Join(s.prefix, snap.SnapDir, snap.SnapName)),
 			UploadId: uploadOutput.UploadId,
 		})
 	} else {
-		ctx = context.TODO()
-		ctx, cancel = context.WithTimeout(ctx, 30*time.Second)
+		chunkUploadCtx, cancel = context.WithTimeout(ctx, 30*time.Second)
 		defer cancel()
 		logrus.Infof("Finishing the multipart upload with upload ID : %s", *uploadOutput.UploadId)
-		_, err = s.client.CompleteMultipartUploadWithContext(ctx, &s3.CompleteMultipartUploadInput{
+		_, err = s.client.CompleteMultipartUploadWithContext(chunkUploadCtx, &s3.CompleteMultipartUploadInput{
 			Bucket:   &s.bucket,
 			Key:      aws.String(path.Join(s.prefix, snap.SnapDir, snap.SnapName)),
 			UploadId: uploadOutput.UploadId,
@@ -193,7 +192,7 @@ func (s *S3SnapStore) Save(snap Snapshot, rc io.ReadCloser) error {
 	return nil
 }
 
-func (s *S3SnapStore) uploadPart(snap *Snapshot, file *os.File, uploadID *string, completedParts []*s3.CompletedPart, offset, chunkSize int64) error {
+func (s *S3SnapStore) uploadPart(ctx context.Context, snap *Snapshot, file *os.File, uploadID *string, completedParts []*s3.CompletedPart, offset, chunkSize int64) error {
 	fileInfo, err := file.Stat()
 	if err != nil {
 		return err
@@ -204,7 +203,7 @@ func (s *S3SnapStore) uploadPart(snap *Snapshot, file *os.File, uploadID *string
 	}
 
 	sr := io.NewSectionReader(file, offset, size)
-	ctx, cancel := context.WithTimeout(context.TODO(), chunkUploadTimeout)
+	chunkUploadCtx, cancel := context.WithTimeout(ctx, chunkUploadTimeout)
 	defer cancel()
 	partNumber := ((offset / chunkSize) + 1)
 	in := &s3.UploadPartInput{
@@ -215,7 +214,7 @@ func (s *S3SnapStore) uploadPart(snap *Snapshot, file *os.File, uploadID *string
 		Body:       sr,
 	}
 
-	part, err := s.client.UploadPartWithContext(ctx, in)
+	part, err := s.client.UploadPartWithContext(chunkUploadCtx, in)
 	if err == nil {
 		completedPart := &s3.CompletedPart{
 			ETag:       part.ETag,
@@ -226,18 +225,18 @@ func (s *S3SnapStore) uploadPart(snap *Snapshot, file *os.File, uploadID *string
 	return err
 }
 
-func (s *S3SnapStore) partUploader(wg *sync.WaitGroup, stopCh <-chan struct{}, snap *Snapshot, file *os.File, uploadID *string, completedParts []*s3.CompletedPart, chunkUploadCh <-chan chunk, errCh chan<- chunkUploadResult) {
+func (s *S3SnapStore) partUploader(ctx context.Context, wg *sync.WaitGroup, snap *Snapshot, file *os.File, uploadID *string, completedParts []*s3.CompletedPart, chunkUploadCh <-chan chunk, errCh chan<- chunkUploadResult) {
 	defer wg.Done()
 	for {
 		select {
-		case <-stopCh:
+		case <-ctx.Done():
 			return
 		case chunk, ok := <-chunkUploadCh:
 			if !ok {
 				return
 			}
 			logrus.Infof("Uploading chunk with id: %d, offset: %d, attempt: %d", chunk.id, chunk.offset, chunk.attempt)
-			err := s.uploadPart(snap, file, uploadID, completedParts, chunk.offset, chunk.size)
+			err := s.uploadPart(ctx, snap, file, uploadID, completedParts, chunk.offset, chunk.size)
 			errCh <- chunkUploadResult{
 				err:   err,
 				chunk: &chunk,
@@ -247,13 +246,13 @@ func (s *S3SnapStore) partUploader(wg *sync.WaitGroup, stopCh <-chan struct{}, s
 }
 
 // List will list the snapshots from store
-func (s *S3SnapStore) List() (SnapList, error) {
+func (s *S3SnapStore) List(ctx context.Context) (SnapList, error) {
 	var snapList SnapList
 	in := &s3.ListObjectsInput{
 		Bucket: aws.String(s.bucket),
 		Prefix: aws.String(fmt.Sprintf("%s/", s.prefix)),
 	}
-	err := s.client.ListObjectsPages(in, func(page *s3.ListObjectsOutput, lastPage bool) bool {
+	err := s.client.ListObjectsPagesWithContext(ctx, in, func(page *s3.ListObjectsOutput, lastPage bool) bool {
 		for _, key := range page.Contents {
 			k := (*key.Key)[len(*page.Prefix):]
 			snap, err := ParseSnapshot(k)
@@ -275,8 +274,8 @@ func (s *S3SnapStore) List() (SnapList, error) {
 }
 
 // Delete should delete the snapshot file from store
-func (s *S3SnapStore) Delete(snap Snapshot) error {
-	_, err := s.client.DeleteObject(&s3.DeleteObjectInput{
+func (s *S3SnapStore) Delete(ctx context.Context, snap Snapshot) error {
+	_, err := s.client.DeleteObjectWithContext(ctx, &s3.DeleteObjectInput{
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(path.Join(s.prefix, snap.SnapDir, snap.SnapName)),
 	})

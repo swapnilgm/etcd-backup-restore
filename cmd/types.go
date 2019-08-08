@@ -57,7 +57,7 @@ var (
 	restorePeerURLs        []string
 	restoreName            string
 	skipHashCheck          bool
-	restoreMaxFetchers     int
+	restoreMaxFetchers     uint
 	embeddedEtcdQuotaBytes int64
 
 	//snapstore flags

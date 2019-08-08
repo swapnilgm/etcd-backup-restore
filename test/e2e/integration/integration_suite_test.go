@@ -15,10 +15,17 @@
 package integration_test
 
 import (
+	"context"
 	"testing"
 
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
+	"github.com/sirupsen/logrus"
+)
+
+var (
+	testCtx = context.Background()
+	logger  = logrus.New().WithField("suite", "integration")
 )
 
 func TestIntegration(t *testing.T) {

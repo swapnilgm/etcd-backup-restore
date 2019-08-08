@@ -16,6 +16,7 @@ package snapstore
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -86,13 +87,13 @@ func NewSwiftSnapstoreFromClient(bucket, prefix, tempDir string, maxParallelChun
 }
 
 // Fetch should open reader for the snapshot file from store
-func (s *SwiftSnapStore) Fetch(snap Snapshot) (io.ReadCloser, error) {
+func (s *SwiftSnapStore) Fetch(ctx context.Context, snap Snapshot) (io.ReadCloser, error) {
 	resp := objects.Download(s.client, s.bucket, path.Join(s.prefix, snap.SnapDir, snap.SnapName), nil)
 	return resp.Body, resp.Err
 }
 
 // Save will write the snapshot to store
-func (s *SwiftSnapStore) Save(snap Snapshot, rc io.ReadCloser) error {
+func (s *SwiftSnapStore) Save(ctx context.Context, snap Snapshot, rc io.ReadCloser) error {
 	// Save it locally
 	tmpfile, err := ioutil.TempFile(s.tempDir, tmpBackupFilePrefix)
 	if err != nil {
@@ -118,15 +119,15 @@ func (s *SwiftSnapStore) Save(snap Snapshot, rc io.ReadCloser) error {
 	}
 
 	var (
-		chunkUploadCh = make(chan chunk, noOfChunks)
-		resCh         = make(chan chunkUploadResult, noOfChunks)
-		wg            sync.WaitGroup
-		cancelCh      = make(chan struct{})
+		chunkUploadCh                     = make(chan chunk, noOfChunks)
+		resCh                             = make(chan chunkUploadResult, noOfChunks)
+		wg                                sync.WaitGroup
+		chunkUploadCtx, cancelChunkUpload = context.WithCancel(ctx)
 	)
 
 	for i := 0; i < s.maxParallelChunkUploads; i++ {
 		wg.Add(1)
-		go s.chunkUploader(&wg, cancelCh, &snap, tmpfile, chunkUploadCh, resCh)
+		go s.chunkUploader(chunkUploadCtx, &wg, &snap, tmpfile, chunkUploadCh, resCh)
 	}
 
 	logrus.Infof("Uploading snapshot of size: %d, chunkSize: %d, noOfChunks: %d", size, chunkSize, noOfChunks)
@@ -141,7 +142,7 @@ func (s *SwiftSnapStore) Save(snap Snapshot, rc io.ReadCloser) error {
 	}
 	logrus.Infof("Triggered chunk upload for all chunks, total: %d", noOfChunks)
 
-	snapshotErr := collectChunkUploadError(chunkUploadCh, resCh, cancelCh, noOfChunks)
+	snapshotErr := collectChunkUploadError(chunkUploadCtx, chunkUploadCh, resCh, cancelChunkUpload, noOfChunks)
 	wg.Wait()
 
 	if snapshotErr != nil {
@@ -182,11 +183,11 @@ func (s *SwiftSnapStore) uploadChunk(snap *Snapshot, file *os.File, offset, chun
 	return res.Err
 }
 
-func (s *SwiftSnapStore) chunkUploader(wg *sync.WaitGroup, stopCh <-chan struct{}, snap *Snapshot, file *os.File, chunkUploadCh chan chunk, errCh chan<- chunkUploadResult) {
+func (s *SwiftSnapStore) chunkUploader(ctx context.Context, wg *sync.WaitGroup, snap *Snapshot, file *os.File, chunkUploadCh chan chunk, errCh chan<- chunkUploadResult) {
 	defer wg.Done()
 	for {
 		select {
-		case <-stopCh:
+		case <-ctx.Done():
 			return
 		case chunk, ok := <-chunkUploadCh:
 			if !ok {
@@ -203,7 +204,7 @@ func (s *SwiftSnapStore) chunkUploader(wg *sync.WaitGroup, stopCh <-chan struct{
 }
 
 // List will list the snapshots from store
-func (s *SwiftSnapStore) List() (SnapList, error) {
+func (s *SwiftSnapStore) List(ctx context.Context) (SnapList, error) {
 	opts := &objects.ListOpts{
 		Full:   false,
 		Prefix: s.prefix,
@@ -241,7 +242,7 @@ func (s *SwiftSnapStore) List() (SnapList, error) {
 }
 
 // Delete should delete the snapshot file from store
-func (s *SwiftSnapStore) Delete(snap Snapshot) error {
+func (s *SwiftSnapStore) Delete(ctx context.Context, snap Snapshot) error {
 	result := objects.Delete(s.client, s.bucket, path.Join(s.prefix, snap.SnapDir, snap.SnapName), nil)
 	return result.Err
 }

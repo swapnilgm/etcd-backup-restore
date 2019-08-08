@@ -32,7 +32,7 @@ func main() {
 	}
 
 	ctx := setupSignalHandler()
-	command := cmd.NewBackupRestoreCommand(ctx)
+	command := cmd.NewBackupRestoreCommand(ctx, os.Stdout, os.Stderr)
 	if err := command.Execute(); err != nil {
 		fmt.Println(err)
 		os.Exit(1)

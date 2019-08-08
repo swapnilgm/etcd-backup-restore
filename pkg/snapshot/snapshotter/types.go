@@ -51,6 +51,7 @@ type State int
 
 // Snapshotter is a struct for etcd snapshot taker
 type Snapshotter struct {
+	ctx                context.Context
 	logger             *logrus.Logger
 	prevSnapshot       *snapstore.Snapshot
 	PrevFullSnapshot   *snapstore.Snapshot

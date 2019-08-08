@@ -15,6 +15,7 @@
 package restorer
 
 import (
+	"context"
 	"time"
 
 	"github.com/coreos/etcd/clientv3"
@@ -30,12 +31,13 @@ const (
 
 // Restorer is a struct for etcd data directory restorer
 type Restorer struct {
-	logger *logrus.Logger
+	logger *logrus.Entry
 	store  snapstore.SnapStore
 }
 
 // RestoreOptions hold all snapshot restore related fields
 type RestoreOptions struct {
+	Ctx                    context.Context
 	ClusterURLs            types.URLsMap
 	ClusterToken           string
 	RestoreDataDir         string

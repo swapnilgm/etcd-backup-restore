@@ -23,6 +23,7 @@ import (
 	"io"
 	"io/ioutil"
 	"math"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
@@ -51,15 +52,15 @@ import (
 )
 
 // NewRestorer returns the restorer object.
-func NewRestorer(store snapstore.SnapStore, logger *logrus.Logger) *Restorer {
+func NewRestorer(store snapstore.SnapStore, logger *logrus.Entry) *Restorer {
 	return &Restorer{
-		logger: logger,
+		logger: logger.WithField("thread", "restorer"),
 		store:  store,
 	}
 }
 
 // Restore restore the etcd data directory as per specified restore options.
-func (r *Restorer) Restore(ro RestoreOptions) error {
+func (r *Restorer) Restore(ctx context.Context, ro RestoreOptions) error {
 	if ro.MaxFetchers < 1 {
 		return fmt.Errorf("Maximum number of fetchers should be greater than zero. Input MaxFetchers: %d", ro.MaxFetchers)
 	}
@@ -75,7 +76,9 @@ func (r *Restorer) Restore(ro RestoreOptions) error {
 		return nil
 	}
 	r.logger.Infof("Starting embedded etcd server...")
-	e, err := startEmbeddedEtcd(ro)
+	embeddedEtcdCtx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+	e, err := startEmbeddedEtcd(embeddedEtcdCtx, ro)
 	if err != nil {
 		return err
 	}
@@ -84,14 +87,17 @@ func (r *Restorer) Restore(ro RestoreOptions) error {
 		e.Close()
 	}()
 
-	client, err := clientv3.NewFromURL(e.Clients[0].Addr().String())
+	client, err := clientv3.New(clientv3.Config{
+		Endpoints: []string{e.Clients[0].Addr().String()},
+		Context:   ctx,
+	})
 	if err != nil {
 		return err
 	}
 	defer client.Close()
 
 	r.logger.Infof("Applying delta snapshots...")
-	return r.applyDeltaSnapshots(client, ro)
+	return r.applyDeltaSnapshots(ctx, client, ro)
 }
 
 // restoreFromBaseSnapshot restore the etcd data directory from base snapshot.
@@ -124,15 +130,15 @@ func (r *Restorer) restoreFromBaseSnapshot(ro RestoreOptions) error {
 
 	walDir := filepath.Join(memberDir, "wal")
 	snapdir := filepath.Join(memberDir, "snap")
-	if err = makeDB(snapdir, ro.BaseSnapshot, len(cl.Members()), r.store, false); err != nil {
+	if err = makeDB(ro.Ctx, snapdir, ro.BaseSnapshot, len(cl.Members()), r.store, false); err != nil {
 		return err
 	}
 	return makeWALAndSnap(walDir, snapdir, cl, ro.Name)
 }
 
 // makeDB copies the database snapshot to the snapshot directory.
-func makeDB(snapdir string, snap snapstore.Snapshot, commit int, ss snapstore.SnapStore, skipHashCheck bool) error {
-	rc, err := ss.Fetch(snap)
+func makeDB(ctx context.Context, snapdir string, snap snapstore.Snapshot, commit int, ss snapstore.SnapStore, skipHashCheck bool) error {
+	rc, err := ss.Fetch(ctx, snap)
 	if err != nil {
 		return err
 	}
@@ -309,8 +315,21 @@ func makeWALAndSnap(waldir, snapdir string, cl *membership.RaftCluster, restoreN
 }
 
 // startEmbeddedEtcd starts the embedded etcd server.
-func startEmbeddedEtcd(ro RestoreOptions) (*embed.Etcd, error) {
+func startEmbeddedEtcd(ctx context.Context, ro RestoreOptions) (*embed.Etcd, error) {
 	cfg := embed.NewConfig()
+	DefaultListenPeerURLs := "http://localhost:0"
+	DefaultListenClientURLs := "http://localhost:0"
+	DefaultInitialAdvertisePeerURLs := "http://localhost:0"
+	DefaultAdvertiseClientURLs := "http://localhost:0"
+	lpurl, _ := url.Parse(DefaultListenPeerURLs)
+	apurl, _ := url.Parse(DefaultInitialAdvertisePeerURLs)
+	lcurl, _ := url.Parse(DefaultListenClientURLs)
+	acurl, _ := url.Parse(DefaultAdvertiseClientURLs)
+	cfg.LPUrls = []url.URL{*lpurl}
+	cfg.LCUrls = []url.URL{*lcurl}
+	cfg.APUrls = []url.URL{*apurl}
+	cfg.ACUrls = []url.URL{*acurl}
+	cfg.InitialCluster = cfg.InitialClusterFromName(cfg.Name)
 	cfg.Dir = filepath.Join(ro.RestoreDataDir)
 	cfg.QuotaBackendBytes = ro.EmbeddedEtcdQuotaBytes
 	e, err := embed.StartEtcd(cfg)
@@ -320,25 +339,24 @@ func startEmbeddedEtcd(ro RestoreOptions) (*embed.Etcd, error) {
 	select {
 	case <-e.Server.ReadyNotify():
 		fmt.Printf("Embedded server is ready!\n")
-	case <-time.After(60 * time.Second):
+	case <-ctx.Done():
 		e.Server.Stop() // trigger a shutdown
 		e.Close()
-		return nil, fmt.Errorf("server took too long to start")
+		return nil, ctx.Err()
 	}
 	return e, nil
 }
 
 // applyDeltaSnapshots fetches the events from delta snapshots in parallel and applies them to the embedded etcd sequentially.
-func (r *Restorer) applyDeltaSnapshots(client *clientv3.Client, ro RestoreOptions) error {
+func (r *Restorer) applyDeltaSnapshots(ctx context.Context, client *clientv3.Client, ro RestoreOptions) error {
 	snapList := ro.DeltaSnapList
 	numMaxFetchers := ro.MaxFetchers
-
 	firstDeltaSnap := snapList[0]
 
-	if err := r.applyFirstDeltaSnapshot(client, *firstDeltaSnap); err != nil {
+	if err := r.applyFirstDeltaSnapshot(ctx, client, *firstDeltaSnap); err != nil {
 		return err
 	}
-	if err := verifySnapshotRevision(client, snapList[0]); err != nil {
+	if err := verifySnapshotRevision(ctx, client, snapList[0]); err != nil {
 		return err
 	}
 
@@ -355,14 +373,14 @@ func (r *Restorer) applyDeltaSnapshots(client *clientv3.Client, ro RestoreOption
 		errCh           = make(chan error, numFetchers+1)
 		fetcherInfoCh   = make(chan fetcherInfo, numSnaps)
 		applierInfoCh   = make(chan applierInfo, numSnaps)
-		stopCh          = make(chan bool)
 		wg              sync.WaitGroup
 	)
+	applierCtx, cancelApply := context.WithCancel(ctx)
 
-	go r.applySnaps(client, remainingSnaps, applierInfoCh, errCh, stopCh, &wg)
+	go r.applySnaps(applierCtx, client, remainingSnaps, applierInfoCh, errCh, &wg)
 
 	for f := 0; f < numFetchers; f++ {
-		go r.fetchSnaps(f, fetcherInfoCh, applierInfoCh, snapLocationsCh, errCh, stopCh, &wg)
+		go r.fetchSnaps(applierCtx, f, fetcherInfoCh, applierInfoCh, snapLocationsCh, errCh, &wg)
 	}
 
 	for i, snap := range remainingSnaps {
@@ -375,7 +393,10 @@ func (r *Restorer) applyDeltaSnapshots(client *clientv3.Client, ro RestoreOption
 	close(fetcherInfoCh)
 
 	err := <-errCh
-	r.cleanup(snapLocationsCh, stopCh, &wg)
+	cancelApply()
+	wg.Wait()
+	r.cleanup(snapLocationsCh)
+
 	if err == nil {
 		r.logger.Infof("Restoration complete.")
 	} else {
@@ -386,11 +407,7 @@ func (r *Restorer) applyDeltaSnapshots(client *clientv3.Client, ro RestoreOption
 }
 
 // cleanup stops all running goroutines and removes the persisted snapshot files from disk.
-func (r *Restorer) cleanup(snapLocationsCh chan string, stopCh chan bool, wg *sync.WaitGroup) {
-	close(stopCh)
-
-	wg.Wait()
-
+func (r *Restorer) cleanup(snapLocationsCh chan string) {
 	close(snapLocationsCh)
 
 	for filePath := range snapLocationsCh {
@@ -404,20 +421,18 @@ func (r *Restorer) cleanup(snapLocationsCh chan string, stopCh chan bool, wg *sy
 }
 
 // fetchSnaps fetches delta snapshots as events and persists them onto disk.
-func (r *Restorer) fetchSnaps(fetcherIndex int, fetcherInfoCh <-chan fetcherInfo, applierInfoCh chan<- applierInfo, snapLocationsCh chan<- string, errCh chan<- error, stopCh chan bool, wg *sync.WaitGroup) {
-	defer wg.Done()
+func (r *Restorer) fetchSnaps(ctx context.Context, fetcherIndex int, fetcherInfoCh <-chan fetcherInfo, applierInfoCh chan<- applierInfo, snapLocationsCh chan<- string, errCh chan<- error, wg *sync.WaitGroup) {
 	wg.Add(1)
+	defer wg.Done()
 
 	for fetcherInfo := range fetcherInfoCh {
 		select {
-		case _, more := <-stopCh:
-			if !more {
-				return
-			}
+		case <-ctx.Done():
+			return
 		default:
 			r.logger.Infof("Fetcher #%d fetching delta snapshot %s", fetcherIndex+1, path.Join(fetcherInfo.Snapshot.SnapDir, fetcherInfo.Snapshot.SnapName))
 
-			eventsData, err := getEventsDataFromDeltaSnapshot(r.store, fetcherInfo.Snapshot)
+			eventsData, err := getEventsDataFromDeltaSnapshot(ctx, r.store, fetcherInfo.Snapshot)
 			if err != nil {
 				errCh <- fmt.Errorf("failed to read events data from delta snapshot %s : %v", fetcherInfo.Snapshot.SnapName, err)
 				applierInfoCh <- applierInfo{SnapIndex: -1} // cannot use close(ch) as concurrent fetchSnaps routines might try to send on channel, causing a panic
@@ -443,7 +458,7 @@ func (r *Restorer) fetchSnaps(fetcherIndex int, fetcherInfoCh <-chan fetcherInfo
 }
 
 // applySnaps applies delta snapshot events to the embedded etcd sequentially, in the right order of snapshots, regardless of the order in which they were fetched.
-func (r *Restorer) applySnaps(client *clientv3.Client, remainingSnaps snapstore.SnapList, applierInfoCh <-chan applierInfo, errCh chan<- error, stopCh <-chan bool, wg *sync.WaitGroup) {
+func (r *Restorer) applySnaps(ctx context.Context, client *clientv3.Client, remainingSnaps snapstore.SnapList, applierInfoCh <-chan applierInfo, errCh chan<- error, wg *sync.WaitGroup) {
 	defer wg.Done()
 	wg.Add(1)
 
@@ -452,10 +467,9 @@ func (r *Restorer) applySnaps(client *clientv3.Client, remainingSnaps snapstore.
 
 	for {
 		select {
-		case _, more := <-stopCh:
-			if !more {
-				return
-			}
+		case <-ctx.Done():
+			r.logger.Infof("Stopped applying snapshot: %v ", ctx.Err())
+			return
 		case applierInfo := <-applierInfoCh:
 			if applierInfo.SnapIndex == -1 {
 				return
@@ -493,7 +507,7 @@ func (r *Restorer) applySnaps(client *clientv3.Client, remainingSnaps snapstore.
 						return
 					}
 
-					if err := applyEventsAndVerify(client, events, remainingSnaps[currSnapIndex]); err != nil {
+					if err := applyEventsAndVerify(ctx, client, events, remainingSnaps[currSnapIndex]); err != nil {
 						errCh <- err
 						return
 					}
@@ -509,21 +523,21 @@ func (r *Restorer) applySnaps(client *clientv3.Client, remainingSnaps snapstore.
 }
 
 // applyEventsAndVerify applies events from one snapshot to the embedded etcd and verifies the correctness of the sequence of snapshot applied.
-func applyEventsAndVerify(client *clientv3.Client, events []event, snap *snapstore.Snapshot) error {
-	if err := applyEventsToEtcd(client, events); err != nil {
+func applyEventsAndVerify(ctx context.Context, client *clientv3.Client, events []event, snap *snapstore.Snapshot) error {
+	if err := applyEventsToEtcd(ctx, client, events); err != nil {
 		return fmt.Errorf("failed to apply events to etcd for delta snapshot %s : %v", snap.SnapName, err)
 	}
 
-	if err := verifySnapshotRevision(client, snap); err != nil {
+	if err := verifySnapshotRevision(ctx, client, snap); err != nil {
 		return fmt.Errorf("snapshot revision verification failed for delta snapshot %s : %v", snap.SnapName, err)
 	}
 	return nil
 }
 
 // applyFirstDeltaSnapshot applies the events from first delta snapshot to etcd.
-func (r *Restorer) applyFirstDeltaSnapshot(client *clientv3.Client, snap snapstore.Snapshot) error {
+func (r *Restorer) applyFirstDeltaSnapshot(ctx context.Context, client *clientv3.Client, snap snapstore.Snapshot) error {
 	r.logger.Infof("Applying first delta snapshot %s", path.Join(snap.SnapDir, snap.SnapName))
-	events, err := getEventsFromDeltaSnapshot(r.store, snap)
+	events, err := getEventsFromDeltaSnapshot(ctx, r.store, snap)
 	if err != nil {
 		return fmt.Errorf("failed to read events from delta snapshot %s : %v", snap.SnapName, err)
 	}
@@ -532,8 +546,7 @@ func (r *Restorer) applyFirstDeltaSnapshot(client *clientv3.Client, snap snapsto
 	// This is because of issue refereed below. So, as per workaround used in our logic of taking delta snapshot,
 	// latest revision from full snapshot may overlap with first few revision on first delta snapshot
 	// Hence, we have to additionally take care of that.
-	// Refer: https://github.com/coreos/etcd/issues/9037
-	ctx := context.TODO()
+	// Refer: https://github.com/etcd-io/etcd/issues/9037
 	resp, err := client.Get(ctx, "", clientv3.WithLastRev()...)
 	if err != nil {
 		return fmt.Errorf("failed to get etcd latest revision: %v", err)
@@ -548,12 +561,12 @@ func (r *Restorer) applyFirstDeltaSnapshot(client *clientv3.Client, snap snapsto
 		}
 	}
 
-	return applyEventsToEtcd(client, events[newRevisionIndex:])
+	return applyEventsToEtcd(ctx, client, events[newRevisionIndex:])
 }
 
 // getEventsFromDeltaSnapshot returns the events from delta snapshot from snap store.
-func getEventsFromDeltaSnapshot(store snapstore.SnapStore, snap snapstore.Snapshot) ([]event, error) {
-	data, err := getEventsDataFromDeltaSnapshot(store, snap)
+func getEventsFromDeltaSnapshot(ctx context.Context, store snapstore.SnapStore, snap snapstore.Snapshot) ([]event, error) {
+	data, err := getEventsDataFromDeltaSnapshot(ctx, store, snap)
 	if err != nil {
 		return nil, err
 	}
@@ -567,8 +580,8 @@ func getEventsFromDeltaSnapshot(store snapstore.SnapStore, snap snapstore.Snapsh
 }
 
 // getEventsDataFromDeltaSnapshot fetches the events data from delta snapshot from snap store.
-func getEventsDataFromDeltaSnapshot(store snapstore.SnapStore, snap snapstore.Snapshot) ([]byte, error) {
-	rc, err := store.Fetch(snap)
+func getEventsDataFromDeltaSnapshot(ctx context.Context, store snapstore.SnapStore, snap snapstore.Snapshot) ([]byte, error) {
+	rc, err := store.Fetch(ctx, snap)
 	if err != nil {
 		return nil, err
 	}
@@ -619,11 +632,10 @@ func persistDeltaSnapshot(data []byte) (string, error) {
 }
 
 // applyEventsToEtcd performs operations in events sequentially.
-func applyEventsToEtcd(client *clientv3.Client, events []event) error {
+func applyEventsToEtcd(ctx context.Context, client *clientv3.Client, events []event) error {
 	var (
 		lastRev int64
 		ops     = []clientv3.Op{}
-		ctx     = context.TODO()
 	)
 
 	for _, e := range events {
@@ -638,8 +650,7 @@ func applyEventsToEtcd(client *clientv3.Client, events []event) error {
 		lastRev = nextRev
 		switch ev.Type {
 		case mvccpb.PUT:
-			ops = append(ops, clientv3.OpPut(string(ev.Kv.Key), string(ev.Kv.Value))) //, clientv3.WithLease(clientv3.LeaseID(ev.Kv.Lease))))
-
+			ops = append(ops, clientv3.OpPut(string(ev.Kv.Key), string(ev.Kv.Value)))
 		case mvccpb.DELETE:
 			ops = append(ops, clientv3.OpDelete(string(ev.Kv.Key)))
 		default:
@@ -650,8 +661,7 @@ func applyEventsToEtcd(client *clientv3.Client, events []event) error {
 	return err
 }
 
-func verifySnapshotRevision(client *clientv3.Client, snap *snapstore.Snapshot) error {
-	ctx := context.TODO()
+func verifySnapshotRevision(ctx context.Context, client *clientv3.Client, snap *snapstore.Snapshot) error {
 	getResponse, err := client.Get(ctx, "foo")
 	if err != nil {
 		return fmt.Errorf("failed to connect to client: %v", err)

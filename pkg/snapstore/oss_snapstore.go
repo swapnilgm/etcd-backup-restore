@@ -15,6 +15,7 @@
 package snapstore
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -95,7 +96,7 @@ func NewOSSFromBucket(prefix, tempDir string, maxParallelChunkUploads int, bucke
 }
 
 // Fetch should open reader for the snapshot file from store
-func (s *OSSSnapStore) Fetch(snap Snapshot) (io.ReadCloser, error) {
+func (s *OSSSnapStore) Fetch(ctx context.Context, snap Snapshot) (io.ReadCloser, error) {
 	body, err := s.bucket.GetObject(path.Join(s.prefix, snap.SnapDir, snap.SnapName))
 	if err != nil {
 		return nil, err
@@ -104,7 +105,7 @@ func (s *OSSSnapStore) Fetch(snap Snapshot) (io.ReadCloser, error) {
 }
 
 // Save will write the snapshot to store
-func (s *OSSSnapStore) Save(snap Snapshot, rc io.ReadCloser) error {
+func (s *OSSSnapStore) Save(ctx context.Context, snap Snapshot, rc io.ReadCloser) error {
 	tmpfile, err := ioutil.TempFile(s.tempDir, tmpBackupFilePrefix)
 	if err != nil {
 		rc.Close()
@@ -144,16 +145,16 @@ func (s *OSSSnapStore) Save(snap Snapshot, rc io.ReadCloser) error {
 	}
 
 	var (
-		completedParts = make([]oss.UploadPart, noOfChunks)
-		chunkUploadCh  = make(chan chunk, noOfChunks)
-		resCh          = make(chan chunkUploadResult, noOfChunks)
-		cancelCh       = make(chan struct{})
-		wg             sync.WaitGroup
+		completedParts                    = make([]oss.UploadPart, noOfChunks)
+		chunkUploadCh                     = make(chan chunk, noOfChunks)
+		resCh                             = make(chan chunkUploadResult, noOfChunks)
+		wg                                sync.WaitGroup
+		chunkUploadCtx, cancelChunkUpload = context.WithCancel(ctx)
 	)
 
 	for i := 0; i < s.maxParallelChunkUploads; i++ {
 		wg.Add(1)
-		go s.partUploader(&wg, imur, tmpfile, completedParts, chunkUploadCh, cancelCh, resCh)
+		go s.partUploader(chunkUploadCtx, &wg, imur, tmpfile, completedParts, chunkUploadCh, resCh)
 	}
 
 	for _, ossChunk := range ossChunks {
@@ -167,7 +168,7 @@ func (s *OSSSnapStore) Save(snap Snapshot, rc io.ReadCloser) error {
 	}
 
 	logrus.Infof("Triggered chunk upload for all chunks, total: %d", noOfChunks)
-	snapshotErr := collectChunkUploadError(chunkUploadCh, resCh, cancelCh, noOfChunks)
+	snapshotErr := collectChunkUploadError(chunkUploadCtx, chunkUploadCh, resCh, cancelChunkUpload, noOfChunks)
 	wg.Wait()
 
 	if snapshotErr == nil {
@@ -187,11 +188,11 @@ func (s *OSSSnapStore) Save(snap Snapshot, rc io.ReadCloser) error {
 	return nil
 }
 
-func (s *OSSSnapStore) partUploader(wg *sync.WaitGroup, imur oss.InitiateMultipartUploadResult, file *os.File, completedParts []oss.UploadPart, chunkUploadCh <-chan chunk, stopCh <-chan struct{}, errCh chan<- chunkUploadResult) {
+func (s *OSSSnapStore) partUploader(ctx context.Context, wg *sync.WaitGroup, imur oss.InitiateMultipartUploadResult, file *os.File, completedParts []oss.UploadPart, chunkUploadCh <-chan chunk, errCh chan<- chunkUploadResult) {
 	defer wg.Done()
 	for {
 		select {
-		case <-stopCh:
+		case <-ctx.Done():
 			return
 		case chunk, ok := <-chunkUploadCh:
 			if !ok {
@@ -218,7 +219,7 @@ func (s *OSSSnapStore) uploadPart(imur oss.InitiateMultipartUploadResult, file *
 }
 
 // List will list the snapshots from store
-func (s *OSSSnapStore) List() (SnapList, error) {
+func (s *OSSSnapStore) List(ctx context.Context) (SnapList, error) {
 	var snapList SnapList
 
 	marker := ""
@@ -248,7 +249,7 @@ func (s *OSSSnapStore) List() (SnapList, error) {
 }
 
 // Delete should delete the snapshot file from store
-func (s *OSSSnapStore) Delete(snap Snapshot) error {
+func (s *OSSSnapStore) Delete(ctx context.Context, snap Snapshot) error {
 	return s.bucket.DeleteObject(path.Join(s.prefix, snap.SnapDir, snap.SnapName))
 }
 

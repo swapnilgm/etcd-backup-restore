@@ -28,7 +28,6 @@ import (
 	"github.com/gardener/etcd-backup-restore/pkg/metrics"
 
 	"github.com/coreos/etcd/clientv3"
-	"github.com/gardener/etcd-backup-restore/pkg/errors"
 	"github.com/gardener/etcd-backup-restore/pkg/etcdutil"
 	"github.com/gardener/etcd-backup-restore/pkg/miscellaneous"
 	"github.com/gardener/etcd-backup-restore/pkg/snapstore"
@@ -71,10 +70,10 @@ func NewSnapshotterConfig(schedule string, store snapstore.SnapStore, maxBackups
 }
 
 // NewSnapshotter returns the snapshotter object.
-func NewSnapshotter(logger *logrus.Logger, config *Config) *Snapshotter {
+func NewSnapshotter(ctx context.Context, logger *logrus.Logger, config *Config) *Snapshotter {
 	// Create dummy previous snapshot
 	var prevSnapshot *snapstore.Snapshot
-	fullSnap, deltaSnapList, err := miscellaneous.GetLatestFullSnapshotAndDeltaSnapList(config.store)
+	fullSnap, deltaSnapList, err := miscellaneous.GetLatestFullSnapshotAndDeltaSnapList(ctx, config.store)
 	if err != nil || fullSnap == nil {
 		prevSnapshot = snapstore.NewSnapshot(snapstore.SnapshotKindFull, 0, 0)
 	} else if len(deltaSnapList) == 0 {
@@ -86,8 +85,8 @@ func NewSnapshotter(logger *logrus.Logger, config *Config) *Snapshotter {
 	}
 
 	metrics.LatestSnapshotRevision.With(prometheus.Labels{metrics.LabelKind: prevSnapshot.Kind}).Set(float64(prevSnapshot.LastRevision))
-
 	return &Snapshotter{
+		ctx:              ctx,
 		logger:           logger,
 		prevSnapshot:     prevSnapshot,
 		PrevFullSnapshot: fullSnap,
@@ -100,9 +99,10 @@ func NewSnapshotter(logger *logrus.Logger, config *Config) *Snapshotter {
 }
 
 // Run process loop for scheduled backup
-// Setting startWithFullSnapshot to false will start the snapshotter without
-// taking the first full snapshot.
-func (ssr *Snapshotter) Run(stopCh <-chan struct{}, startWithFullSnapshot bool) error {
+// Setting <startWithFullSnapshot> to false will start the snapshotter without
+// taking the first full snapshot. To stop the loop on should cancel the context passed while creating
+// snapshotter.
+func (ssr *Snapshotter) Run(startWithFullSnapshot bool) error {
 	if startWithFullSnapshot {
 		ssr.fullSnapshotTimer = time.NewTimer(0)
 	} else {
@@ -111,16 +111,15 @@ func (ssr *Snapshotter) Run(stopCh <-chan struct{}, startWithFullSnapshot bool) 
 		// to take the first delta snapshot(s) initially and then set
 		// the full snapshot schedule
 		if ssr.watchCh == nil {
-			ssrStopped, err := ssr.CollectEventsSincePrevSnapshot(stopCh)
-			if ssrStopped {
-				return nil
-			}
+			err := ssr.CollectEventsSincePrevSnapshot()
 			if err != nil {
-				return fmt.Errorf("Failed to collect events for first delta snapshot(s): %v", err)
+				ssr.logger.Errorf("Failed to collect events for first delta snapshot(s): %v", err)
+				return err
 			}
 		}
 		if err := ssr.resetFullSnapshotTimer(); err != nil {
-			return fmt.Errorf("failed to reset full snapshot timer: %v", err)
+			ssr.logger.Errorf("failed to reset full snapshot timer: %v", err)
+			return err
 		}
 	}
 
@@ -131,7 +130,7 @@ func (ssr *Snapshotter) Run(stopCh <-chan struct{}, startWithFullSnapshot bool) 
 	}
 
 	defer ssr.stop()
-	return ssr.snapshotEventHandler(stopCh)
+	return ssr.snapshotEventHandler()
 }
 
 // TriggerFullSnapshot sends the events to take full snapshot. This is to
@@ -203,46 +202,43 @@ func (ssr *Snapshotter) takeFullSnapshot() error {
 
 	client, err := etcdutil.GetTLSClientForEtcd(ssr.config.tlsConfig)
 	if err != nil {
-		return &errors.EtcdError{
-			Message: fmt.Sprintf("failed to create etcd client: %v", err),
-		}
+		ssr.logger.Errorf("failed to create etcd client: %v", err)
+		return err
 	}
 
-	ctx, cancel := context.WithTimeout(context.TODO(), ssr.config.etcdConnectionTimeout*time.Second)
+	connectionCtx, cancel := context.WithTimeout(ssr.ctx, ssr.config.etcdConnectionTimeout*time.Second)
 	// Note: Although Get and snapshot call are not atomic, so revision number in snapshot file
 	// may be ahead of the revision found from GET call. But currently this is the only workaround available
 	// Refer: https://github.com/coreos/etcd/issues/9037
-	resp, err := client.Get(ctx, "", clientv3.WithLastRev()...)
+	resp, err := client.Get(connectionCtx, "", clientv3.WithLastRev()...)
 	cancel()
 	if err != nil {
-		return &errors.EtcdError{
-			Message: fmt.Sprintf("failed to get etcd latest revision: %v", err),
-		}
+		ssr.logger.Errorf("failed to get etcd latest revision: %v", err)
+		return err
 	}
 	lastRevision := resp.Header.Revision
 
 	if ssr.prevSnapshot.Kind == snapstore.SnapshotKindFull && ssr.prevSnapshot.LastRevision == lastRevision {
 		ssr.logger.Infof("There are no updates since last snapshot, skipping full snapshot.")
 	} else {
-		ctx, cancel = context.WithTimeout(context.TODO(), ssr.config.etcdConnectionTimeout*time.Second)
+		connectionCtx, cancel = context.WithTimeout(ssr.ctx, ssr.config.etcdConnectionTimeout*time.Second)
 		defer cancel()
-		rc, err := client.Snapshot(ctx)
+		rc, err := client.Snapshot(connectionCtx)
 		if err != nil {
-			return &errors.EtcdError{
-				Message: fmt.Sprintf("failed to create etcd snapshot: %v", err),
-			}
+			ssr.logger.Errorf("failed to get etcd snapshot reader: %v", err)
+			return err
 		}
 		ssr.logger.Infof("Successfully opened snapshot reader on etcd")
 		s := snapstore.NewSnapshot(snapstore.SnapshotKindFull, 0, lastRevision)
 		startTime := time.Now()
-		if err := ssr.config.store.Save(*s, rc); err != nil {
-			timeTaken := time.Now().Sub(startTime).Seconds()
+		if err := ssr.config.store.Save(ssr.ctx, *s, rc); err != nil {
+			timeTaken := time.Since(startTime).Seconds()
 			metrics.SnapshotDurationSeconds.With(prometheus.Labels{metrics.LabelKind: snapstore.SnapshotKindFull, metrics.LabelSucceeded: metrics.ValueSucceededFalse}).Observe(timeTaken)
-			return &errors.SnapstoreError{
-				Message: fmt.Sprintf("failed to save snapshot: %v", err),
-			}
+			ssr.logger.Errorf("failed to save snapshot: %v", err)
+			return err
 		}
-		timeTaken := time.Now().Sub(startTime).Seconds()
+
+		timeTaken := time.Since(startTime).Seconds()
 		metrics.SnapshotDurationSeconds.With(prometheus.Labels{metrics.LabelKind: snapstore.SnapshotKindFull, metrics.LabelSucceeded: metrics.ValueSucceededTrue}).Observe(timeTaken)
 		logrus.Infof("Total time to save snapshot: %f seconds.", timeTaken)
 		ssr.prevSnapshot = s
@@ -258,7 +254,7 @@ func (ssr *Snapshotter) takeFullSnapshot() error {
 		return nil
 	}
 
-	watchCtx, cancelWatch := context.WithCancel(context.TODO())
+	watchCtx, cancelWatch := context.WithCancel(ssr.ctx)
 	ssr.cancelWatch = cancelWatch
 	ssr.etcdClient = client
 	ssr.watchCh = client.Watch(watchCtx, "", clientv3.WithPrefix(), clientv3.WithRev(ssr.prevSnapshot.LastRevision+1))
@@ -313,13 +309,13 @@ func (ssr *Snapshotter) TakeDeltaSnapshot() error {
 	}
 	ssr.events = hash.Sum(ssr.events)
 	startTime := time.Now()
-	if err := ssr.config.store.Save(*snap, ioutil.NopCloser(bytes.NewReader(ssr.events))); err != nil {
-		timeTaken := time.Now().Sub(startTime).Seconds()
+	if err := ssr.config.store.Save(ssr.ctx, *snap, ioutil.NopCloser(bytes.NewReader(ssr.events))); err != nil {
+		timeTaken := time.Since(startTime).Seconds()
 		metrics.SnapshotDurationSeconds.With(prometheus.Labels{metrics.LabelKind: snapstore.SnapshotKindDelta, metrics.LabelSucceeded: metrics.ValueSucceededFalse}).Observe(timeTaken)
 		ssr.logger.Errorf("Error saving delta snapshots. %v", err)
 		return err
 	}
-	timeTaken := time.Now().Sub(startTime).Seconds()
+	timeTaken := time.Since(startTime).Seconds()
 	metrics.SnapshotDurationSeconds.With(prometheus.Labels{metrics.LabelKind: snapstore.SnapshotKindDelta, metrics.LabelSucceeded: metrics.ValueSucceededTrue}).Observe(timeTaken)
 	logrus.Infof("Total time to save delta snapshot: %f seconds.", timeTaken)
 	ssr.prevSnapshot = snap
@@ -330,33 +326,31 @@ func (ssr *Snapshotter) TakeDeltaSnapshot() error {
 }
 
 // CollectEventsSincePrevSnapshot takes the first delta snapshot on etcd startup.
-func (ssr *Snapshotter) CollectEventsSincePrevSnapshot(stopCh <-chan struct{}) (bool, error) {
+func (ssr *Snapshotter) CollectEventsSincePrevSnapshot() error {
 	// close any previous watch and client.
 	ssr.closeEtcdClient()
 
 	client, err := etcdutil.GetTLSClientForEtcd(ssr.config.tlsConfig)
 	if err != nil {
-		return false, &errors.EtcdError{
-			Message: fmt.Sprintf("failed to create etcd client: %v", err),
-		}
+		ssr.logger.Errorf("failed to create etcd client: %v", err)
+		return err
 	}
 
-	ctx, cancel := context.WithTimeout(context.TODO(), ssr.config.etcdConnectionTimeout*time.Second)
-	resp, err := client.Get(ctx, "", clientv3.WithLastRev()...)
+	ctxForRevision, cancel := context.WithTimeout(ssr.ctx, ssr.config.etcdConnectionTimeout*time.Second)
+	resp, err := client.Get(ctxForRevision, "", clientv3.WithLastRev()...)
 	cancel()
 	if err != nil {
-		return false, &errors.EtcdError{
-			Message: fmt.Sprintf("failed to get etcd latest revision: %v", err),
-		}
+		ssr.logger.Errorf("failed to get etcd latest revision: %v", err)
+		return err
 	}
 	lastEtcdRevision := resp.Header.Revision
 
 	if ssr.prevSnapshot.LastRevision == lastEtcdRevision {
 		ssr.logger.Infof("No new events since last snapshot. Skipping initial delta snapshot.")
-		return false, nil
+		return nil
 	}
 
-	watchCtx, cancelWatch := context.WithCancel(context.TODO())
+	watchCtx, cancelWatch := context.WithCancel(ssr.ctx)
 	ssr.cancelWatch = cancelWatch
 	ssr.etcdClient = client
 	ssr.watchCh = client.Watch(watchCtx, "", clientv3.WithPrefix(), clientv3.WithRev(ssr.prevSnapshot.LastRevision+1))
@@ -366,19 +360,23 @@ func (ssr *Snapshotter) CollectEventsSincePrevSnapshot(stopCh <-chan struct{}) (
 		select {
 		case wr, ok := <-ssr.watchCh:
 			if !ok {
-				return false, fmt.Errorf("watch channel closed")
+				// As per etcd implementation watch channel closes only when the
+				// context passed to Watch API is canceled. Hence wrapping error
+				// here in context error rather than creating common error.
+				ssr.logger.Errorf("watch channel closed. %v", wr)
+				return fmt.Errorf("watch channel closed. %v", wr)
 			}
 			if err := ssr.handleDeltaWatchEvents(wr); err != nil {
-				return false, err
+				return err
 			}
 
 			lastWatchRevision := wr.Events[len(wr.Events)-1].Kv.ModRevision
 			if lastWatchRevision >= lastEtcdRevision {
-				return false, nil
+				return nil
 			}
-		case <-stopCh:
+		case <-ssr.ctx.Done():
 			ssr.cleanupInMemoryEvents()
-			return true, nil
+			return ssr.ctx.Err()
 		}
 	}
 }
@@ -417,7 +415,7 @@ func newEvent(e *clientv3.Event) *event {
 	}
 }
 
-func (ssr *Snapshotter) snapshotEventHandler(stopCh <-chan struct{}) error {
+func (ssr *Snapshotter) snapshotEventHandler() error {
 	for {
 		select {
 		case <-ssr.fullSnapshotCh:
@@ -436,14 +434,18 @@ func (ssr *Snapshotter) snapshotEventHandler(stopCh <-chan struct{}) error {
 			}
 		case wr, ok := <-ssr.watchCh:
 			if !ok {
-				return fmt.Errorf("watch channel closed")
+				// As per etcd implementation watch channel closes only when the
+				// context passed to Watch API is canceled. Hence wrapping error
+				// here in context error rather than creating common error.
+				ssr.logger.Errorf("watch channel closed at snapshot event handler. %v", wr)
+				return context.Canceled
 			}
 			if err := ssr.handleDeltaWatchEvents(wr); err != nil {
 				return err
 			}
-		case <-stopCh:
+		case <-ssr.ctx.Done():
 			ssr.cleanupInMemoryEvents()
-			return nil
+			return ssr.ctx.Err()
 		}
 	}
 }

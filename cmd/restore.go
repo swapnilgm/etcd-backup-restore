@@ -40,7 +40,7 @@ func NewRestoreCommand(ctx context.Context) *cobra.Command {
 			- Find the latest snapshot.
 			- Restore etcd data diretory from full snapshot.
 			*/
-			logger := logrus.New()
+			logger := logrus.NewEntry(logrus.Logger)
 			clusterUrlsMap, err := types.NewURLsMap(restoreCluster)
 			if err != nil {
 				logger.Fatalf("failed creating url map for restore cluster: %v", err)
@@ -86,7 +86,7 @@ func NewRestoreCommand(ctx context.Context) *cobra.Command {
 				EmbeddedEtcdQuotaBytes: embeddedEtcdQuotaBytes,
 			}
 
-			err = rs.Restore(*options)
+			err = rs.Restore(ctx, *options)
 			if err != nil {
 				logger.Fatalf("Failed to restore snapshot: %v", err)
 				return
@@ -108,7 +108,7 @@ func initializeEtcdFlags(cmd *cobra.Command) {
 	cmd.Flags().StringArrayVar(&restorePeerURLs, "initial-advertise-peer-urls", []string{defaultInitialAdvertisePeerURLs}, "list of this member's peer URLs to advertise to the rest of the cluster")
 	cmd.Flags().StringVar(&restoreName, "name", defaultName, "human-readable name for this member")
 	cmd.Flags().BoolVar(&skipHashCheck, "skip-hash-check", false, "ignore snapshot integrity hash value (required if copied from data directory)")
-	cmd.Flags().IntVar(&restoreMaxFetchers, "max-fetchers", 6, "maximum number of threads that will fetch delta snapshots in parallel")
+	cmd.Flags().UintVar(&restoreMaxFetchers, "max-fetchers", 6, "maximum number of threads that will fetch delta snapshots in parallel")
 	cmd.Flags().Int64Var(&embeddedEtcdQuotaBytes, "embedded-etcd-quota-bytes", int64(8*1024*1024*1024), "maximum backend quota for the embedded etcd used for applying delta snapshots")
 }
 

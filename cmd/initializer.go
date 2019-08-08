@@ -82,7 +82,7 @@ func NewInitializeCommand(ctx context.Context) *cobra.Command {
 				}
 			}
 			etcdInitializer := initializer.NewInitializer(options, snapstoreConfig, logger)
-			err = etcdInitializer.Initialize(mode, failBelowRevision)
+			err = etcdInitializer.Initialize(ctx, mode, failBelowRevision)
 			if err != nil {
 				logger.Fatalf("initializer failed. %v", err)
 			}

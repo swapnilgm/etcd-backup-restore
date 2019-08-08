@@ -134,13 +134,13 @@ var _ = Describe("CloudBackup", func() {
 		)
 
 		BeforeEach(func() {
-			store, err = snapstore.GetSnapstore(snapstoreConfig)
+			store, err = snapstore.GetSnapstore(testCtx, snapstoreConfig)
 			Expect(err).ShouldNot(HaveOccurred())
 
-			snapList, err := store.List()
+			snapList, err := store.List(testCtx)
 			Expect(err).ShouldNot(HaveOccurred())
 			for _, snap := range snapList {
-				store.Delete(*snap)
+				store.Delete(testCtx, *snap)
 			}
 
 			cmdEtcd, etcdErrChan = startEtcd()
@@ -158,13 +158,13 @@ var _ = Describe("CloudBackup", func() {
 
 		Context("taken at 1 minute interval", func() {
 			It("should take periodic backups.", func() {
-				snaplist, err := store.List()
+				snaplist, err := store.List(testCtx)
 				Expect(snaplist).Should(BeEmpty())
 				Expect(err).ShouldNot(HaveOccurred())
 
 				time.Sleep(70 * time.Second)
 
-				snaplist, err = store.List()
+				snaplist, err = store.List(testCtx)
 				Expect(snaplist).ShouldNot(BeEmpty())
 				Expect(err).ShouldNot(HaveOccurred())
 			})
@@ -172,13 +172,13 @@ var _ = Describe("CloudBackup", func() {
 
 		Context("taken at 1 minute interval", func() {
 			It("should take periodic backups and limit based garbage collect backups over maxBackups configured", func() {
-				snaplist, err := store.List()
+				snaplist, err := store.List(testCtx)
 				Expect(snaplist).Should(BeEmpty())
 				Expect(err).ShouldNot(HaveOccurred())
 
 				time.Sleep(190 * time.Second)
 
-				snaplist, err = store.List()
+				snaplist, err = store.List(testCtx)
 				Expect(err).ShouldNot(HaveOccurred())
 				count := 0
 				for _, snap := range snaplist {
@@ -203,7 +203,6 @@ var _ = Describe("CloudBackup", func() {
 
 	Describe("EtcdCorruptionCheck", func() {
 		var cmd *Cmd
-		logger := logrus.New()
 
 		Context("checks a healthy data dir", func() {
 			It("valids non corrupt data directory", func() {
@@ -216,7 +215,7 @@ var _ = Describe("CloudBackup", func() {
 						SnapstoreConfig: snapstoreConfig,
 					},
 				}
-				dataDirStatus, err := dataValidator.Validate(validator.Full, 0)
+				dataDirStatus, err := dataValidator.Validate(testCtx, validator.Full, 0)
 				Expect(err).ShouldNot(HaveOccurred())
 				Expect(dataDirStatus).Should(Equal(validator.DataDirStatus(validator.DataDirectoryValid)))
 			})
@@ -248,7 +247,7 @@ var _ = Describe("CloudBackup", func() {
 						SnapstoreConfig: snapstoreConfig,
 					},
 				}
-				dataDirStatus, err := dataValidator.Validate(validator.Full, 0)
+				dataDirStatus, err := dataValidator.Validate(testCtx, validator.Full, 0)
 				Expect(err).ShouldNot(HaveOccurred())
 				Expect(dataDirStatus).Should(SatisfyAny(Equal(validator.DataDirStatus(validator.DataDirectoryCorrupt)), Equal(validator.DataDirStatus(validator.RevisionConsistencyError))))
 			})
@@ -272,7 +271,6 @@ var _ = Describe("CloudBackup", func() {
 			})
 
 			It("restores corrupt data directory", func() {
-				logger = logrus.New()
 				dataDir := os.Getenv("ETCD_DATA_DIR")
 				dbFilePath := filepath.Join(dataDir, "member", "snap", "db")
 				file, err := os.Create(dbFilePath)
@@ -291,7 +289,7 @@ var _ = Describe("CloudBackup", func() {
 				cmd = &Cmd{
 					Task:    "etcdbrctl",
 					Flags:   etcdbrctlArgs,
-					Logger:  logger,
+					Logger:  logger.Logger,
 					Logfile: filepath.Join(os.Getenv("TEST_DIR"), "etcdbrctl.log"),
 				}
 				err = cmd.RunCmdWithFlags()

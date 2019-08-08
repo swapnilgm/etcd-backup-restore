@@ -15,6 +15,7 @@
 package cmd
 
 import (
+	"io"
 	"context"
 	"fmt"
 	"net/http"
@@ -23,9 +24,7 @@ import (
 	"time"
 
 	"github.com/sirupsen/logrus"
-
 	"github.com/coreos/etcd/pkg/types"
-	"github.com/gardener/etcd-backup-restore/pkg/errors"
 	"github.com/gardener/etcd-backup-restore/pkg/etcdutil"
 	"github.com/gardener/etcd-backup-restore/pkg/initializer"
 	"github.com/gardener/etcd-backup-restore/pkg/server"
@@ -36,136 +35,29 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// NewServerCommand create cobra command for snapshot
-func NewServerCommand(ctx context.Context) *cobra.Command {
+// NewServerCommand create cobra command for snapshot.
+func NewServerCommand(ctx context.Context, out, errOut io.Writer) *cobra.Command {
+	opts:= newOptions(out, errOut)
 	var serverCmd = &cobra.Command{
 		Use:   "server",
 		Short: "start the http server with backup scheduler.",
 		Long:  `Server will keep listening for http request to deliver its functionality through http endpoints.`,
 		Run: func(cmd *cobra.Command, args []string) {
 			printVersionInfo()
-			var (
-				snapstoreConfig    *snapstore.Config
-				ssrStopCh          chan struct{}
-				ackCh              chan struct{}
-				ssr                *snapshotter.Snapshotter
-				handler            *server.HTTPHandler
-				snapshotterEnabled bool
-			)
-			ackCh = make(chan struct{})
-			clusterUrlsMap, err := types.NewURLsMap(restoreCluster)
-			if err != nil {
-				logger.Fatalf("failed creating url map for restore cluster: %v", err)
-			}
-			peerUrls, err := types.NewURLs(restorePeerURLs)
-			if err != nil {
-				logger.Fatalf("failed parsing peers urls for restore cluster: %v", err)
-			}
-
-			options := &restorer.RestoreOptions{
-				RestoreDataDir:         path.Clean(restoreDataDir),
-				Name:                   restoreName,
-				ClusterURLs:            clusterUrlsMap,
-				PeerURLs:               peerUrls,
-				ClusterToken:           restoreClusterToken,
-				SkipHashCheck:          skipHashCheck,
-				MaxFetchers:            restoreMaxFetchers,
-				EmbeddedEtcdQuotaBytes: embeddedEtcdQuotaBytes,
-			}
-
-			if storageProvider == "" {
-				snapshotterEnabled = false
-				logger.Warnf("No snapstore storage provider configured. Will not start backup schedule.")
-			} else {
-				snapshotterEnabled = true
-				snapstoreConfig = &snapstore.Config{
-					Provider:                storageProvider,
-					Container:               storageContainer,
-					Prefix:                  path.Join(storagePrefix, backupFormatVersion),
-					MaxParallelChunkUploads: maxParallelChunkUploads,
-					TempDir:                 snapstoreTempDir,
-				}
-			}
-
-			etcdInitializer := initializer.NewInitializer(options, snapstoreConfig, logger)
-
-			tlsConfig := etcdutil.NewTLSConfig(
-				certFile,
-				keyFile,
-				caFile,
-				insecureTransport,
-				insecureSkipVerify,
-				etcdEndpoints,
-				etcdUsername,
-				etcdPassword)
-
-			if snapshotterEnabled {
-				ss, err := snapstore.GetSnapstore(snapstoreConfig)
-				if err != nil {
-					logger.Fatalf("Failed to create snapstore from configured storage provider: %v", err)
-				}
-				logger.Infof("Created snapstore from provider: %s", storageProvider)
-
-				snapshotterConfig, err := snapshotter.NewSnapshotterConfig(
-					fullSnapshotSchedule,
-					ss,
-					maxBackups,
-					deltaSnapshotIntervalSeconds,
-					deltaSnapshotMemoryLimit,
-					time.Duration(etcdConnectionTimeout),
-					time.Duration(garbageCollectionPeriodSeconds),
-					garbageCollectionPolicy,
-					tlsConfig)
-				if err != nil {
-					logger.Fatalf("failed to create snapshotter config: %v", err)
-				}
-
-				logger.Infof("Creating snapshotter...")
-				ssr = snapshotter.NewSnapshotter(
-					logger,
-					snapshotterConfig,
-				)
-
-				handler = startHTTPServer(etcdInitializer, ssr)
-				defer handler.Stop()
-
-				ssrStopCh = make(chan struct{})
-				go handleSsrStopRequest(handler, ssr, ackCh, ssrStopCh, ctx.Done())
-				go handleAckState(handler, ackCh)
-
-				defragSchedule, err := cron.ParseStandard(defragmentationSchedule)
-				if err != nil {
-					logger.Fatalf("failed to parse defragmentation schedule: %v", err)
-					return
-				}
-				go etcdutil.DefragDataPeriodically(ctx, tlsConfig, defragSchedule, time.Duration(etcdConnectionTimeout)*time.Second, ssr.TriggerFullSnapshot, logrus.NewEntry(logger))
-
-				runEtcdProbeLoopWithSnapshotter(tlsConfig, handler, ssr, ssrStopCh, ctx.Done(), ackCh)
+			if err:= opts.loadConfigFromFile(); err !=nil {
+				opts.Logger.Fatlaf("failed to load the config from file: %v",err)
+			return
+		}
+			if err:=opts.valEidate(); err !=nil {
+				opts.Logger.Fatalf("failed to validate the options: %v",err)
 				return
 			}
-			// If no storage provider is given, snapshotter will be nil, in which
-			// case the status is set to OK as soon as etcd probe is successful
-			handler = startHTTPServer(etcdInitializer, nil)
-			defer handler.Stop()
-
-			// start defragmentation without trigerring full snapshot
-			// after each successful data defragmentation
-			defragSchedule, err := cron.ParseStandard(defragmentationSchedule)
-			if err != nil {
-				logger.Fatalf("failed to parse defragmentation schedule: %v", err)
-				return
+			if err:=opts.run(); err !=nil {
+				opts.Logger.Fatalf("failed to run with options: %v",err)
 			}
-			go etcdutil.DefragDataPeriodically(ctx, tlsConfig, defragSchedule, time.Duration(etcdConnectionTimeout)*time.Second, nil, logrus.NewEntry(logger))
-
-			runEtcdProbeLoopWithoutSnapshotter(tlsConfig, handler, ctx.Done(), ackCh)
-
 		},
 	}
-
-	initializeServerFlags(serverCmd)
-	initializeSnapshotterFlags(serverCmd)
-	initializeSnapstoreFlags(serverCmd)
-	initializeEtcdFlags(serverCmd)
+	opts.AddFlags(serverCmd.Flags())
 	return serverCmd
 }
 
@@ -179,7 +71,6 @@ func startHTTPServer(initializer initializer.Initializer, ssr *snapshotter.Snaps
 		Initializer:     initializer,
 		Snapshotter:     ssr,
 		Logger:          logger,
-		StopCh:          make(chan struct{}),
 		EnableProfiling: enableProfiling,
 		ReqCh:           make(chan struct{}),
 		AckCh:           make(chan struct{}),
@@ -195,7 +86,7 @@ func startHTTPServer(initializer initializer.Initializer, ssr *snapshotter.Snaps
 
 // runEtcdProbeLoopWithoutSnapshotter runs the etcd probe loop
 // for the case where snapshotter is configured correctly
-func runEtcdProbeLoopWithSnapshotter(tlsConfig *etcdutil.TLSConfig, handler *server.HTTPHandler, ssr *snapshotter.Snapshotter, ssrStopCh chan struct{}, stopCh <-chan struct{}, ackCh chan struct{}) {
+func runEtcdProbeLoopWithSnapshotter(ctx context.Context, tlsConfig *etcdutil.TLSConfig, handler *server.HTTPHandler, ssr *snapshotter.Snapshotter,  ackCh chan struct{}) error {
 	var (
 		err                       error
 		initialDeltaSnapshotTaken bool
@@ -204,11 +95,10 @@ func runEtcdProbeLoopWithSnapshotter(tlsConfig *etcdutil.TLSConfig, handler *ser
 	for {
 		logger.Infof("Probing etcd...")
 		select {
-		case <-stopCh:
-			logger.Info("Shutting down...")
-			return
+		case <-ctx.Done():
+			return ctx.Err()
 		default:
-			err = ProbeEtcd(tlsConfig)
+			err = ProbeEtcd(ctx, tlsConfig)
 		}
 		if err != nil {
 			logger.Errorf("Failed to probe etcd: %v", err)
@@ -232,8 +122,8 @@ func runEtcdProbeLoopWithSnapshotter(tlsConfig *etcdutil.TLSConfig, handler *ser
 		// supposed to be, according to the given cron schedule, instead of the
 		// hard-coded "24 hours" full snapshot interval
 		if ssr.PrevFullSnapshot != nil && time.Since(ssr.PrevFullSnapshot.CreatedOn).Hours() <= 24 {
-			ssrStopped, err := ssr.CollectEventsSincePrevSnapshot(ssrStopCh)
-			if ssrStopped {
+			err := ssr.CollectEventsSincePrevSnapshot()
+			if err {
 				logger.Info("Snapshotter stopped.")
 				ackCh <- emptyStruct
 				handler.SetStatus(http.StatusServiceUnavailable)
@@ -264,47 +154,49 @@ func runEtcdProbeLoopWithSnapshotter(tlsConfig *etcdutil.TLSConfig, handler *ser
 		ssr.SsrStateMutex.Lock()
 		ssr.SsrState = snapshotter.SnapshotterActive
 		ssr.SsrStateMutex.Unlock()
-		gcStopCh := make(chan struct{})
-		go ssr.RunGarbageCollector(gcStopCh)
+
+		go ssr.RunGarbageCollector()
 		logger.Infof("Starting snapshotter...")
-		if err := ssr.Run(ssrStopCh, initialDeltaSnapshotTaken); err != nil {
+		if err := ssr.Run(initialDeltaSnapshotTaken); err != nil {
 			if etcdErr, ok := err.(*errors.EtcdError); ok == true {
 				logger.Errorf("Snapshotter failed with etcd error: %v", etcdErr)
 			} else {
-				logger.Fatalf("Snapshotter failed with error: %v", err)
+				return err
 			}
 		}
 		logger.Infof("Snapshotter stopped.")
 		ackCh <- emptyStruct
 		handler.SetStatus(http.StatusServiceUnavailable)
-		close(gcStopCh)
 	}
 }
 
 // runEtcdProbeLoopWithoutSnapshotter runs the etcd probe loop
 // for the case where snapshotter is not configured
-func runEtcdProbeLoopWithoutSnapshotter(tlsConfig *etcdutil.TLSConfig, handler *server.HTTPHandler, stopCh <-chan struct{}, ackCh chan struct{}) {
-	var err error
+func runEtcdProbeLoopWithoutSnapshotter(ctx context.Context, tlsConfig *etcdutil.TLSConfig, handler *server.HTTPHandler, ackCh chan struct{}) error {
 	for {
 		logger.Infof("Probing etcd...")
 		select {
-		case <-stopCh:
-			logger.Info("Shutting down...")
-			return
-		default:
-			err = ProbeEtcd(tlsConfig)
-		}
-		if err != nil {
-			logger.Errorf("Failed to probe etcd: %v", err)
+		case <-ctx.Done():
 			handler.SetStatus(http.StatusServiceUnavailable)
-			continue
+			return ctx.Err()
+		default:
+			err = ProbeEtcd(ctx, tlsConfig)
+
+			if err != nil {
+				logger.Errorf("Failed to probe etcd: %v", err)
+				switch err.(type) {
+				case context.DeadlineExceeded, context.Canceled:
+					return
+				}
+				handler.SetStatus(http.StatusServiceUnavailable)
+				continue
+			}
 		}
 
 		handler.SetStatus(http.StatusOK)
-		<-stopCh
+		<-ctx.Done()
 		handler.SetStatus(http.StatusServiceUnavailable)
-		logger.Infof("Received stop signal. Terminating !!")
-		return
+		return ctx.Err()
 	}
 }
 
@@ -316,45 +208,35 @@ func initializeServerFlags(serverCmd *cobra.Command) {
 
 // ProbeEtcd will make the snapshotter probe for etcd endpoint to be available
 // before it starts taking regular snapshots.
-func ProbeEtcd(tlsConfig *etcdutil.TLSConfig) error {
+func ProbeEtcd(ctx context.Context, tlsConfig *etcdutil.TLSConfig) error {
 	client, err := etcdutil.GetTLSClientForEtcd(tlsConfig)
 	if err != nil {
-		return &errors.EtcdError{
-			Message: fmt.Sprintf("failed to create etcd client: %v", err),
-		}
+		logger.Errorf("failed to create etcd client: %v", err)
+		return err
 	}
 
-	ctx, cancel := context.WithTimeout(context.TODO(), time.Duration(etcdConnectionTimeout)*time.Second)
+	connectionCtx, cancel := context.WithTimeout(ctx, time.Duration(etcdConnectionTimeout)*time.Second)
 	defer cancel()
-	if _, err := client.Get(ctx, "foo"); err != nil {
+	if _, err := client.Get(connectionCtx, "foo"); err != nil {
 		logger.Errorf("Failed to connect to client: %v", err)
 		return err
 	}
 	return nil
 }
 
-func handleAckState(handler *server.HTTPHandler, ackCh chan struct{}) {
-	for {
-		<-ackCh
-		if atomic.CompareAndSwapUint32(&handler.AckState, server.HandlerAckWaiting, server.HandlerAckDone) {
-			handler.AckCh <- emptyStruct
-		}
-	}
-}
-
 // handleSsrStopRequest responds to handlers request and stop interrupt.
-func handleSsrStopRequest(handler *server.HTTPHandler, ssr *snapshotter.Snapshotter, ackCh, ssrStopCh chan struct{}, stopCh <-chan struct{}) {
+func handleSsrStopRequest(ctx context.Context, cancelSsr func(), handler *server.HTTPHandler, ackCh  chan struct{}) {
 	for {
 		var ok bool
 		select {
 		case _, ok = <-handler.ReqCh:
-		case _, ok = <-stopCh:
+		case _, ok = <-ctx.Done():
 		}
 
 		ssr.SsrStateMutex.Lock()
 		if ssr.SsrState == snapshotter.SnapshotterActive {
 			ssr.SsrStateMutex.Unlock()
-			ssrStopCh <- emptyStruct
+			cancelSsr()
 		} else {
 			ssr.SsrState = snapshotter.SnapshotterInactive
 			ssr.SsrStateMutex.Unlock()

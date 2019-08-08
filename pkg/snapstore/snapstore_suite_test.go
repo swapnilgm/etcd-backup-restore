@@ -15,18 +15,19 @@
 package snapstore_test
 
 import (
+	"context"
 	"testing"
-
-	"github.com/sirupsen/logrus"
 
 	"github.com/gardener/etcd-backup-restore/pkg/snapstore"
 	th "github.com/gophercloud/gophercloud/testhelper"
 	fake "github.com/gophercloud/gophercloud/testhelper/client"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
+	"github.com/sirupsen/logrus"
 )
 
 var (
+	testCtx    = context.Background()
 	testObj    *testing.T
 	swiftStore snapstore.SnapStore
 )

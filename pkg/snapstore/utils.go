@@ -15,6 +15,7 @@
 package snapstore
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path"
@@ -29,7 +30,7 @@ const (
 )
 
 // GetSnapstore returns the snapstore object for give storageProvider with specified container
-func GetSnapstore(config *Config) (SnapStore, error) {
+func GetSnapstore(ctx context.Context, config *Config) (SnapStore, error) {
 	if config.Container == "" {
 		config.Container = os.Getenv(envStorageContainer)
 	}
@@ -66,12 +67,12 @@ func GetSnapstore(config *Config) (SnapStore, error) {
 		if config.Container == "" {
 			return nil, fmt.Errorf("storage container name not specified")
 		}
-		return NewABSSnapStore(config.Container, config.Prefix, config.TempDir, config.MaxParallelChunkUploads)
+		return NewABSSnapStore(ctx, config.Container, config.Prefix, config.TempDir, config.MaxParallelChunkUploads)
 	case SnapstoreProviderGCS:
 		if config.Container == "" {
 			return nil, fmt.Errorf("storage container name not specified")
 		}
-		return NewGCSSnapStore(config.Container, config.Prefix, config.TempDir, config.MaxParallelChunkUploads)
+		return NewGCSSnapStore(ctx, config.Container, config.Prefix, config.TempDir, config.MaxParallelChunkUploads)
 	case SnapstoreProviderSwift:
 		if config.Container == "" {
 			return nil, fmt.Errorf("storage container name not specified")
@@ -100,38 +101,44 @@ func GetEnvVarOrError(varName string) (string, error) {
 }
 
 // collectChunkUploadError collects the error from all go routine to upload individual chunks
-func collectChunkUploadError(chunkUploadCh chan<- chunk, resCh <-chan chunkUploadResult, stopCh chan struct{}, noOfChunks int64) *chunkUploadResult {
+func collectChunkUploadError(ctx context.Context, chunkUploadCh chan<- chunk, resCh <-chan chunkUploadResult, cancel func(), noOfChunks int64) *chunkUploadResult {
 	remainingChunks := noOfChunks
 	logrus.Infof("No of Chunks:= %d", noOfChunks)
-	for chunkRes := range resCh {
-		logrus.Infof("Received chunk result for id: %d, offset: %d", chunkRes.chunk.id, chunkRes.chunk.offset)
-		if chunkRes.err != nil {
-			logrus.Infof("Chunk upload failed for id: %d, offset: %d with err: %v", chunkRes.chunk.id, chunkRes.chunk.offset, chunkRes.err)
-			if chunkRes.chunk.attempt == maxRetryAttempts {
-				logrus.Errorf("Received the chunk upload error even after %d attempts from one of the workers. Sending stop signal to all workers.", chunkRes.chunk.attempt)
-				close(stopCh)
-				return &chunkRes
+	for {
+		select {
+		case <-ctx.Done():
+			return &chunkUploadResult{
+				err: ctx.Err(),
 			}
-			chunk := chunkRes.chunk
-			delayTime := (1 << chunk.attempt)
-			chunk.attempt++
-			logrus.Warnf("Will try to upload chunk id: %d, offset: %d at attempt %d  after %d seconds", chunk.id, chunk.offset, chunk.attempt, delayTime)
-			time.AfterFunc(time.Duration(delayTime)*time.Second, func() {
-				select {
-				case <-stopCh:
-					return
-				default:
-					chunkUploadCh <- *chunk
+		case chunkRes := <-resCh:
+			logrus.Infof("Received chunk result for id: %d, offset: %d", chunkRes.chunk.id, chunkRes.chunk.offset)
+			if chunkRes.err != nil {
+				logrus.Infof("Chunk upload failed for id: %d, offset: %d with err: %v", chunkRes.chunk.id, chunkRes.chunk.offset, chunkRes.err)
+				if chunkRes.chunk.attempt == maxRetryAttempts {
+					logrus.Errorf("Received the chunk upload error even after %d attempts from one of the workers. Sending stop signal to all workers.", chunkRes.chunk.attempt)
+					cancel()
+					return &chunkRes
 				}
-			})
-		} else {
-			remainingChunks--
-			if remainingChunks == 0 {
-				logrus.Infof("Received successful chunk result for all chunks. Stopping workers.")
-				close(stopCh)
-				break
+				chunk := chunkRes.chunk
+				delayTime := (1 << chunk.attempt)
+				chunk.attempt++
+				logrus.Warnf("Will try to upload chunk id: %d, offset: %d at attempt %d  after %d seconds", chunk.id, chunk.offset, chunk.attempt, delayTime)
+				time.AfterFunc(time.Duration(delayTime)*time.Second, func() {
+					select {
+					case <-ctx.Done():
+						return
+					default:
+						chunkUploadCh <- *chunk
+					}
+				})
+			} else {
+				remainingChunks--
+				if remainingChunks == 0 {
+					logrus.Infof("Received successful chunk result for all chunks. Stopping workers.")
+					cancel()
+					return nil
+				}
 			}
 		}
 	}
-	return nil
 }

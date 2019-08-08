@@ -55,7 +55,6 @@ var _ = Describe("Running Restorer", func() {
 
 	BeforeEach(func() {
 		fmt.Println("Initializing snapstore and restorer")
-
 		restoreDataDir = etcdDir
 		restoreClusterToken = "etcd-cluster"
 		restoreName = "default"
@@ -72,13 +71,13 @@ var _ = Describe("Running Restorer", func() {
 		err = corruptEtcdDir()
 		Expect(err).ShouldNot(HaveOccurred())
 
-		store, err = snapstore.GetSnapstore(&snapstore.Config{Container: snapstoreDir, Provider: "Local"})
+		store, err = snapstore.GetSnapstore(testCtx, &snapstore.Config{Container: snapstoreDir, Provider: "Local"})
 		Expect(err).ShouldNot(HaveOccurred())
 
-		baseSnapshot, deltaSnapList, err = miscellaneous.GetLatestFullSnapshotAndDeltaSnapList(store)
+		baseSnapshot, deltaSnapList, err = miscellaneous.GetLatestFullSnapshotAndDeltaSnapList(testCtx, store)
 		Expect(err).ShouldNot(HaveOccurred())
 
-		rstr = NewRestorer(store, logger.Logger)
+		rstr = NewRestorer(store, logger)
 	})
 
 	Context("with zero fetchers", func() {
@@ -98,7 +97,7 @@ var _ = Describe("Running Restorer", func() {
 				BaseSnapshot:           *baseSnapshot,
 				DeltaSnapList:          deltaSnapList,
 			}
-			err = rstr.Restore(restoreOptions)
+			err = rstr.Restore(testCtx, restoreOptions)
 			Expect(err).Should(HaveOccurred())
 		})
 	})
@@ -120,7 +119,7 @@ var _ = Describe("Running Restorer", func() {
 				BaseSnapshot:           *baseSnapshot,
 				DeltaSnapList:          deltaSnapList,
 			}
-			err = rstr.Restore(restoreOptions)
+			err = rstr.Restore(testCtx, restoreOptions)
 			Expect(err).ShouldNot(HaveOccurred())
 
 			err = checkDataConsistency(testCtx, restoreDataDir, logger)
@@ -145,7 +144,7 @@ var _ = Describe("Running Restorer", func() {
 				BaseSnapshot:           *baseSnapshot,
 				DeltaSnapList:          deltaSnapList,
 			}
-			err = rstr.Restore(restoreOptions)
+			err = rstr.Restore(testCtx, restoreOptions)
 			Expect(err).ShouldNot(HaveOccurred())
 
 			err = checkDataConsistency(testCtx, restoreDataDir, logger)
@@ -170,7 +169,7 @@ var _ = Describe("Running Restorer", func() {
 				BaseSnapshot:           *baseSnapshot,
 				DeltaSnapList:          deltaSnapList,
 			}
-			err = rstr.Restore(restoreOptions)
+			err = rstr.Restore(testCtx, restoreOptions)
 			Expect(err).ShouldNot(HaveOccurred())
 
 			err = checkDataConsistency(testCtx, restoreDataDir, logger)

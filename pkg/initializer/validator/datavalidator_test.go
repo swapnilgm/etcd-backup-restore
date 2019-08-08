@@ -5,12 +5,11 @@ import (
 	"os"
 	"path"
 
+	. "github.com/gardener/etcd-backup-restore/pkg/initializer/validator"
 	"github.com/gardener/etcd-backup-restore/pkg/snapstore"
 	"github.com/gardener/etcd-backup-restore/test/utils"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
-
-	. "github.com/gardener/etcd-backup-restore/pkg/initializer/validator"
 )
 
 var _ = Describe("Running Datavalidator", func() {
@@ -35,7 +34,7 @@ var _ = Describe("Running Datavalidator", func() {
 				DataDir:         restoreDataDir,
 				SnapstoreConfig: snapstoreConfig,
 			},
-			Logger: logger.Logger,
+			Logger: logger,
 		}
 	})
 	Context("with missing data directory", func() {
@@ -43,7 +42,7 @@ var _ = Describe("Running Datavalidator", func() {
 			tempDir := fmt.Sprintf("%s.%s", restoreDataDir, "temp")
 			err = os.Rename(restoreDataDir, tempDir)
 			Expect(err).ShouldNot(HaveOccurred())
-			dataDirStatus, err := validator.Validate(Full, 0)
+			dataDirStatus, err := validator.Validate(testCtx, Full, 0)
 			Expect(err).Should(HaveOccurred())
 			Expect(int(dataDirStatus)).Should(SatisfyAny(Equal(DataDirectoryNotExist), Equal(DataDirectoryError)))
 			err = os.Rename(tempDir, restoreDataDir)
@@ -59,7 +58,7 @@ var _ = Describe("Running Datavalidator", func() {
 					tempDir := fmt.Sprintf("%s.%s", memberDir, "temp")
 					err = os.Rename(memberDir, tempDir)
 					Expect(err).ShouldNot(HaveOccurred())
-					dataDirStatus, err := validator.Validate(Full, 0)
+					dataDirStatus, err := validator.Validate(testCtx, Full, 0)
 					Expect(err).ShouldNot(HaveOccurred())
 					Expect(int(dataDirStatus)).Should(SatisfyAny(Equal(DataDirectoryInvStruct), Equal(DataDirectoryError)))
 					err = os.Rename(tempDir, memberDir)
@@ -73,7 +72,7 @@ var _ = Describe("Running Datavalidator", func() {
 						tempDir := fmt.Sprintf("%s.%s", snapDir, "temp")
 						err = os.Rename(snapDir, tempDir)
 						Expect(err).ShouldNot(HaveOccurred())
-						dataDirStatus, err := validator.Validate(Full, 0)
+						dataDirStatus, err := validator.Validate(testCtx, Full, 0)
 						Expect(err).ShouldNot(HaveOccurred())
 						Expect(int(dataDirStatus)).Should(SatisfyAny(Equal(DataDirectoryInvStruct), Equal(DataDirectoryError)))
 						err = os.Rename(tempDir, snapDir)
@@ -86,7 +85,7 @@ var _ = Describe("Running Datavalidator", func() {
 						tempDir := fmt.Sprintf("%s.%s", walDir, "temp")
 						err = os.Rename(walDir, tempDir)
 						Expect(err).ShouldNot(HaveOccurred())
-						dataDirStatus, err := validator.Validate(Full, 0)
+						dataDirStatus, err := validator.Validate(testCtx, Full, 0)
 						Expect(err).ShouldNot(HaveOccurred())
 						Expect(int(dataDirStatus)).Should(SatisfyAny(Equal(DataDirectoryInvStruct), Equal(DataDirectoryError)))
 						err = os.Rename(tempDir, walDir)
@@ -102,7 +101,7 @@ var _ = Describe("Running Datavalidator", func() {
 						Expect(err).ShouldNot(HaveOccurred())
 						err = os.Mkdir(walDir, 0700)
 						Expect(err).ShouldNot(HaveOccurred())
-						dataDirStatus, err := validator.Validate(Sanity, 0)
+						dataDirStatus, err := validator.Validate(testCtx, Sanity, 0)
 						Expect(err).ShouldNot(HaveOccurred())
 						Expect(int(dataDirStatus)).Should(Equal(DataDirectoryValid))
 						err = os.RemoveAll(walDir)
@@ -126,7 +125,9 @@ var _ = Describe("Running Datavalidator", func() {
 					// populate etcd but with lesser data than previous populate call, so that the new db has a lower revision
 					resp := &utils.EtcdDataPopulationResponse{}
 					utils.PopulateEtcd(testCtx, logger, endpoints, 0, int(keyTo/2), resp)
+
 					Expect(resp.Err).ShouldNot(HaveOccurred())
+
 					etcd.Close()
 
 					fmt.Printf("\nPrev etcd revision: %d\nNew etcd revision:  %d\n", etcdRevision, resp.EndRevision)
@@ -135,7 +136,7 @@ var _ = Describe("Running Datavalidator", func() {
 					// newEtcdRevision: current revision number on etcd db
 					Expect(etcdRevision).To(BeNumerically(">=", resp.EndRevision))
 
-					dataDirStatus, err := validator.Validate(Full, 0)
+					dataDirStatus, err := validator.Validate(testCtx, Full, 0)
 					Expect(err).ShouldNot(HaveOccurred())
 					Expect(int(dataDirStatus)).Should(SatisfyAny(Equal(RevisionConsistencyError), Equal(DataDirectoryError)))
 
@@ -146,6 +147,7 @@ var _ = Describe("Running Datavalidator", func() {
 					Expect(err).ShouldNot(HaveOccurred())
 				})
 			})
+
 			Context("with consistent revision numbers between etcd and latest snapshot", func() {
 				Context("with corrupt data directory", func() {
 					Context("with corrupt db file", func() {
@@ -171,7 +173,7 @@ var _ = Describe("Running Datavalidator", func() {
 							_, err = file.Write(byteSlice)
 							Expect(err).ShouldNot(HaveOccurred())
 
-							dataDirStatus, err := validator.Validate(Full, 0)
+							dataDirStatus, err := validator.Validate(testCtx, Full, 0)
 							Expect(err).ShouldNot(HaveOccurred())
 							Expect(int(dataDirStatus)).Should(SatisfyAny(Equal(DataDirectoryCorrupt), Equal(DataDirectoryError), Equal(RevisionConsistencyError)))
 
@@ -186,7 +188,7 @@ var _ = Describe("Running Datavalidator", func() {
 				Context("with clean data directory", func() {
 					Context("with fail below revision configured to low value", func() {
 						It("should return DataDirStatus as DataDirectoryValid, and nil error", func() {
-							dataDirStatus, err := validator.Validate(Full, 0)
+							dataDirStatus, err := validator.Validate(testCtx, Full, 0)
 							Expect(err).ShouldNot(HaveOccurred())
 							Expect(int(dataDirStatus)).Should(Equal(DataDirectoryValid))
 						})
@@ -195,7 +197,7 @@ var _ = Describe("Running Datavalidator", func() {
 					Context("with fail below revision configured to high value", func() {
 						It("should return DataDirStatus as FailBelowRevisionConsistencyError and nil error", func() {
 							validator.Config.SnapstoreConfig.Container = path.Join(snapstoreBackupDir, "tmp")
-							dataDirStatus, err := validator.Validate(Full, 1000000)
+							dataDirStatus, err := validator.Validate(testCtx, Full, 1000000)
 							Expect(err).ShouldNot(HaveOccurred())
 							Expect(int(dataDirStatus)).Should(Equal(FailBelowRevisionConsistencyError))
 						})

@@ -34,7 +34,7 @@ import (
 	. "github.com/gardener/etcd-backup-restore/pkg/snapstore"
 )
 
-func newFakeABSSnapstore() SnapStore {
+func newFakeABSSnapstore(ctx context.Context) SnapStore {
 	f := []pipeline.Factory{
 		pipeline.MethodFactoryMarker(),
 		newFakePolicyFactory(bucket, prefix, objectMap),
@@ -44,7 +44,7 @@ func newFakeABSSnapstore() SnapStore {
 	Expect(err).ShouldNot(HaveOccurred())
 	serviceURL := azblob.NewServiceURL(*u, p)
 	containerURL := serviceURL.NewContainerURL(bucket)
-	a, err := GetABSSnapstoreFromClient(bucket, prefix, "/tmp", 5, &containerURL)
+	a, err := GetABSSnapstoreFromClient(ctx, bucket, prefix, "/tmp", 5, &containerURL)
 	Expect(err).ShouldNot(HaveOccurred())
 	return a
 }

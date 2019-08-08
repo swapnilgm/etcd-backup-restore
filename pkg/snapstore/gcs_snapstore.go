@@ -47,8 +47,7 @@ const (
 )
 
 // NewGCSSnapStore create new GCSSnapStore from shared configuration with specified bucket.
-func NewGCSSnapStore(bucket, prefix, tempDir string, maxParallelChunkUploads int) (*GCSSnapStore, error) {
-	ctx := context.TODO()
+func NewGCSSnapStore(ctx context.Context, bucket, prefix, tempDir string, maxParallelChunkUploads int) (*GCSSnapStore, error) {
 	cli, err := storage.NewClient(ctx)
 	if err != nil {
 		return nil, err
@@ -70,14 +69,13 @@ func NewGCSSnapStoreFromClient(bucket, prefix, tempDir string, maxParallelChunkU
 }
 
 // Fetch should open reader for the snapshot file from store.
-func (s *GCSSnapStore) Fetch(snap Snapshot) (io.ReadCloser, error) {
+func (s *GCSSnapStore) Fetch(ctx context.Context, snap Snapshot) (io.ReadCloser, error) {
 	objectName := path.Join(s.prefix, snap.SnapDir, snap.SnapName)
-	ctx := context.TODO()
 	return s.client.Bucket(s.bucket).Object(objectName).NewReader(ctx)
 }
 
 // Save will write the snapshot to store.
-func (s *GCSSnapStore) Save(snap Snapshot, rc io.ReadCloser) error {
+func (s *GCSSnapStore) Save(ctx context.Context, snap Snapshot, rc io.ReadCloser) error {
 	tmpfile, err := ioutil.TempFile(s.tempDir, tmpBackupFilePrefix)
 	if err != nil {
 		rc.Close()
@@ -102,15 +100,15 @@ func (s *GCSSnapStore) Save(snap Snapshot, rc io.ReadCloser) error {
 	}
 
 	var (
-		chunkUploadCh = make(chan chunk, noOfChunks)
-		resCh         = make(chan chunkUploadResult, noOfChunks)
-		wg            sync.WaitGroup
-		cancelCh      = make(chan struct{})
+		chunkUploadCh                     = make(chan chunk, noOfChunks)
+		resCh                             = make(chan chunkUploadResult, noOfChunks)
+		wg                                sync.WaitGroup
+		chunkUploadCtx, cancelChunkUpload = context.WithCancel(ctx)
 	)
 
 	for i := 0; i < s.maxParallelChunkUploads; i++ {
 		wg.Add(1)
-		go s.componentUploader(&wg, cancelCh, &snap, tmpfile, chunkUploadCh, resCh)
+		go s.componentUploader(chunkUploadCtx, &wg, &snap, tmpfile, chunkUploadCh, resCh)
 	}
 
 	logrus.Infof("Uploading snapshot of size: %d, chunkSize: %d, noOfChunks: %d", size, chunkSize, noOfChunks)
@@ -125,7 +123,7 @@ func (s *GCSSnapStore) Save(snap Snapshot, rc io.ReadCloser) error {
 	}
 	logrus.Infof("Triggered chunk upload for all chunks, total: %d", noOfChunks)
 
-	snapshotErr := collectChunkUploadError(chunkUploadCh, resCh, cancelCh, noOfChunks)
+	snapshotErr := collectChunkUploadError(chunkUploadCtx, chunkUploadCh, resCh, cancelChunkUpload, noOfChunks)
 	wg.Wait()
 
 	if snapshotErr != nil {
@@ -142,16 +140,16 @@ func (s *GCSSnapStore) Save(snap Snapshot, rc io.ReadCloser) error {
 	name := path.Join(s.prefix, snap.SnapDir, snap.SnapName)
 	obj := bh.Object(name)
 	c := obj.ComposerFrom(subObjects...)
-	ctx, cancel := context.WithTimeout(context.TODO(), chunkUploadTimeout)
+	chunkUploadCtx, cancel := context.WithTimeout(ctx, chunkUploadTimeout)
 	defer cancel()
-	if _, err := c.Run(ctx); err != nil {
+	if _, err := c.Run(chunkUploadCtx); err != nil {
 		return fmt.Errorf("failed uploading composite object for snapshot with error: %v", err)
 	}
 	logrus.Info("Composite object uploaded successfully.")
 	return nil
 }
 
-func (s *GCSSnapStore) uploadComponent(snap *Snapshot, file *os.File, offset, chunkSize int64) error {
+func (s *GCSSnapStore) uploadComponent(ctx context.Context, snap *Snapshot, file *os.File, offset, chunkSize int64) error {
 	fileInfo, err := file.Stat()
 	if err != nil {
 		return err
@@ -166,9 +164,9 @@ func (s *GCSSnapStore) uploadComponent(snap *Snapshot, file *os.File, offset, ch
 	partNumber := ((offset / chunkSize) + 1)
 	name := path.Join(s.prefix, snap.SnapDir, snap.SnapName, fmt.Sprintf("%010d", partNumber))
 	obj := bh.Object(name)
-	ctx, cancel := context.WithTimeout(context.TODO(), chunkUploadTimeout)
+	chunkUploadCtx, cancel := context.WithTimeout(ctx, chunkUploadTimeout)
 	defer cancel()
-	w := obj.NewWriter(ctx)
+	w := obj.NewWriter(chunkUploadCtx)
 	if _, err := io.Copy(w, sr); err != nil {
 		w.Close()
 		return err
@@ -176,18 +174,18 @@ func (s *GCSSnapStore) uploadComponent(snap *Snapshot, file *os.File, offset, ch
 	return w.Close()
 }
 
-func (s *GCSSnapStore) componentUploader(wg *sync.WaitGroup, stopCh <-chan struct{}, snap *Snapshot, file *os.File, chunkUploadCh chan chunk, errCh chan<- chunkUploadResult) {
+func (s *GCSSnapStore) componentUploader(ctx context.Context, wg *sync.WaitGroup, snap *Snapshot, file *os.File, chunkUploadCh chan chunk, errCh chan<- chunkUploadResult) {
 	defer wg.Done()
 	for {
 		select {
-		case <-stopCh:
+		case <-ctx.Done():
 			return
 		case chunk, ok := <-chunkUploadCh:
 			if !ok {
 				return
 			}
 			logrus.Infof("Uploading chunk with offset : %d, attempt: %d", chunk.offset, chunk.attempt)
-			err := s.uploadComponent(snap, file, chunk.offset, chunk.size)
+			err := s.uploadComponent(ctx, snap, file, chunk.offset, chunk.size)
 			errCh <- chunkUploadResult{
 				err:   err,
 				chunk: &chunk,
@@ -197,8 +195,8 @@ func (s *GCSSnapStore) componentUploader(wg *sync.WaitGroup, stopCh <-chan struc
 }
 
 // List will list the snapshots from store.
-func (s *GCSSnapStore) List() (SnapList, error) {
-	it := s.client.Bucket(s.bucket).Objects(context.TODO(), &storage.Query{Prefix: s.prefix})
+func (s *GCSSnapStore) List(ctx context.Context) (SnapList, error) {
+	it := s.client.Bucket(s.bucket).Objects(ctx, &storage.Query{Prefix: s.prefix})
 
 	var attrs []*storage.ObjectAttrs
 	for {
@@ -230,7 +228,7 @@ func (s *GCSSnapStore) List() (SnapList, error) {
 }
 
 // Delete should delete the snapshot file from store.
-func (s *GCSSnapStore) Delete(snap Snapshot) error {
+func (s *GCSSnapStore) Delete(ctx context.Context, snap Snapshot) error {
 	objectName := path.Join(s.prefix, snap.SnapDir, snap.SnapName)
-	return s.client.Bucket(s.bucket).Object(objectName).Delete(context.TODO())
+	return s.client.Bucket(s.bucket).Object(objectName).Delete(ctx)
 }

@@ -15,6 +15,7 @@
 package validator
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -76,7 +77,7 @@ func (d *DataValidator) backendPath() string { return filepath.Join(d.snapDir(),
 //			- If data directory structure is invalid return DataDirectoryInvStruct status.
 //       * Check for data corruption.
 //			- return data directory corruption status.
-func (d *DataValidator) Validate(mode Mode, failBelowRevision int64) (DataDirStatus, error) {
+func (d *DataValidator) Validate(ctx context.Context, mode Mode, failBelowRevision int64) (DataDirStatus, error) {
 	dataDir := d.Config.DataDir
 	dirExists, err := directoryExist(dataDir)
 	if err != nil {
@@ -98,7 +99,7 @@ func (d *DataValidator) Validate(mode Mode, failBelowRevision int64) (DataDirSta
 
 	if d.Config.SnapstoreConfig != nil {
 		d.Logger.Info("Checking for revision consistency...")
-		failBelowRevisionCheck, err := checkRevisionConsistency(d.backendPath(), *d.Config.SnapstoreConfig, failBelowRevision)
+		failBelowRevisionCheck, err := checkRevisionConsistency(ctx, d.backendPath(), *d.Config.SnapstoreConfig, failBelowRevision)
 		if err != nil {
 			d.Logger.Infof("Etcd revision inconsistent with latest snapshot revision: %v", err)
 			if failBelowRevisionCheck {
@@ -343,19 +344,19 @@ func verifyDB(path string) error {
 
 // checkRevisionConsistency compares the latest revisions on the etcd db file and the latest snapshot to verify that the etcd revision is not lesser than snapshot revision.
 // Return true or false indicating whether it is due to failBelowRevision or latest snapshot revision for snapstore.
-func checkRevisionConsistency(dbPath string, config snapstore.Config, failBelowRevision int64) (bool, error) {
+func checkRevisionConsistency(ctx context.Context, dbPath string, config snapstore.Config, failBelowRevision int64) (bool, error) {
 	etcdRevision, err := getLatestEtcdRevision(dbPath)
 	if err != nil {
 		return false, fmt.Errorf("unable to get current etcd revision from backend db file: %v", err)
 	}
 
-	store, err := snapstore.GetSnapstore(&config)
+	store, err := snapstore.GetSnapstore(ctx, &config)
 	if err != nil {
 		return false, fmt.Errorf("unable to fetch snapstore: %v", err)
 	}
 
 	var latestSnapshotRevision int64
-	fullSnap, deltaSnaps, err := miscellaneous.GetLatestFullSnapshotAndDeltaSnapList(store)
+	fullSnap, deltaSnaps, err := miscellaneous.GetLatestFullSnapshotAndDeltaSnapList(ctx, store)
 	if err != nil {
 		return false, fmt.Errorf("unable to get snapshots from store: %v", err)
 	}

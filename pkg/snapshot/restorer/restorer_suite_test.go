@@ -41,7 +41,7 @@ const (
 
 var (
 	testCtx   = context.Background()
-	logger    = logrus.New().WithField("suite", "restorer")
+	logger    *logrus.Entry
 	etcd      *embed.Etcd
 	err       error
 	keyTo     int
@@ -58,6 +58,9 @@ var _ = SynchronizedBeforeSuite(func() []byte {
 		data []byte
 	)
 
+	logger = logrus.New().WithField("suite", "restorer")
+	logger.Logger.SetOutput(GinkgoWriter)
+
 	err = os.RemoveAll(outputDir)
 	Expect(err).ShouldNot(HaveOccurred())
 
@@ -68,26 +71,25 @@ var _ = SynchronizedBeforeSuite(func() []byte {
 		etcd.Close()
 	}()
 
+	deltaSnapshotPeriod := 5
 	populatorTimeout := time.Duration(snapshotterDurationSeconds * time.Second)
 	populatorCtx, cancelPopulator := context.WithTimeout(testCtx, populatorTimeout)
 	defer cancelPopulator()
 	resp := &utils.EtcdDataPopulationResponse{}
 	go utils.PopulateEtcd(populatorCtx, logger, endpoints, 0, math.MaxInt64, resp)
 
-	deltaSnapshotPeriod := 5
 	snapshotterTimeout := populatorTimeout + time.Duration(deltaSnapshotPeriod+2)*time.Second
 	ctx, cancel := context.WithTimeout(testCtx, snapshotterTimeout)
 	defer cancel()
 	err = runSnapshotter(ctx, logger, deltaSnapshotPeriod, endpoints)
-	Expect(err).ShouldNot(HaveOccurred())
 
+	Expect(err).Should(Or(Equal(context.DeadlineExceeded), Equal(context.Canceled)))
 	keyTo = resp.KeyTo
 	return data
 }, func(data []byte) {})
 
 var _ = SynchronizedAfterSuite(func() {}, func() {
-	err = os.RemoveAll(outputDir)
-	Expect(err).ShouldNot(HaveOccurred())
+	os.RemoveAll(outputDir)
 })
 
 // runSnapshotter creates a snapshotter object and runs it for a duration specified by 'snapshotterDurationSeconds'
@@ -108,7 +110,7 @@ func runSnapshotter(ctx context.Context, logger *logrus.Entry, deltaSnapshotPeri
 		etcdPassword                   string
 	)
 
-	store, err = snapstore.GetSnapstore(&snapstore.Config{Container: snapstoreDir, Provider: "Local"})
+	store, err = snapstore.GetSnapstore(ctx, &snapstore.Config{Container: snapstoreDir, Provider: "Local"})
 	if err != nil {
 		return err
 	}
@@ -140,9 +142,10 @@ func runSnapshotter(ctx context.Context, logger *logrus.Entry, deltaSnapshotPeri
 	}
 
 	ssr := snapshotter.NewSnapshotter(
+		ctx,
 		logger.Logger,
 		snapshotterConfig,
 	)
 
-	return ssr.Run(ctx.Done(), true)
+	return ssr.Run(true)
 }

@@ -15,6 +15,7 @@
 package initializer
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -42,9 +43,9 @@ const (
 //       * Check if Latest snapshot available.
 //		   - Try to perform an Etcd data restoration from the latest snapshot.
 //		   - No snapshots are available, start etcd as a fresh installation.
-func (e *EtcdInitializer) Initialize(mode validator.Mode, failBelowRevision int64) error {
+func (e *EtcdInitializer) Initialize(ctx context.Context, mode validator.Mode, failBelowRevision int64) error {
 	start := time.Now()
-	dataDirStatus, err := e.Validator.Validate(mode, failBelowRevision)
+	dataDirStatus, err := e.Validator.Validate(ctx, mode, failBelowRevision)
 	if err != nil && dataDirStatus != validator.DataDirectoryNotExist {
 		metrics.ValidationDurationSeconds.With(prometheus.Labels{metrics.LabelSucceeded: metrics.ValueSucceededFalse}).Observe(time.Now().Sub(start).Seconds())
 		return fmt.Errorf("error while initializing: %v", err)
@@ -58,7 +59,7 @@ func (e *EtcdInitializer) Initialize(mode validator.Mode, failBelowRevision int6
 
 	if dataDirStatus != validator.DataDirectoryValid {
 		start := time.Now()
-		if err := e.restoreCorruptData(); err != nil {
+		if err := e.restoreCorruptData(ctx); err != nil {
 			metrics.RestorationDurationSeconds.With(prometheus.Labels{metrics.LabelSucceeded: metrics.ValueSucceededFalse}).Observe(time.Now().Sub(start).Seconds())
 			return fmt.Errorf("error while restoring corrupt data: %v", err)
 		}
@@ -68,7 +69,7 @@ func (e *EtcdInitializer) Initialize(mode validator.Mode, failBelowRevision int6
 }
 
 //NewInitializer creates an etcd initializer object.
-func NewInitializer(options *restorer.RestoreOptions, snapstoreConfig *snapstore.Config, logger *logrus.Logger) *EtcdInitializer {
+func NewInitializer(options *restorer.RestoreOptions, snapstoreConfig *snapstore.Config, logger *logrus.Entry) *EtcdInitializer {
 
 	etcdInit := &EtcdInitializer{
 		Config: &Config{
@@ -80,15 +81,15 @@ func NewInitializer(options *restorer.RestoreOptions, snapstoreConfig *snapstore
 				DataDir:         options.RestoreDataDir,
 				SnapstoreConfig: snapstoreConfig,
 			},
-			Logger: logger,
+			Logger: logger.WithField("thread", "validator"),
 		},
-		Logger: logger,
+		Logger: logger.WithField("thread", "etcdInitializer"),
 	}
 
 	return etcdInit
 }
 
-func (e *EtcdInitializer) restoreCorruptData() error {
+func (e *EtcdInitializer) restoreCorruptData(ctx context.Context) error {
 	logger := e.Logger
 	dataDir := e.Config.RestoreOptions.RestoreDataDir
 
@@ -100,13 +101,13 @@ func (e *EtcdInitializer) restoreCorruptData() error {
 		}
 		return nil
 	}
-	store, err := snapstore.GetSnapstore(e.Config.SnapstoreConfig)
+	store, err := snapstore.GetSnapstore(ctx, e.Config.SnapstoreConfig)
 	if err != nil {
 		err = fmt.Errorf("failed to create snapstore from configured storage provider: %v", err)
 		return err
 	}
 	logger.Info("Finding latest set of snapshot to recover from...")
-	baseSnap, deltaSnapList, err := miscellaneous.GetLatestFullSnapshotAndDeltaSnapList(store)
+	baseSnap, deltaSnapList, err := miscellaneous.GetLatestFullSnapshotAndDeltaSnapList(ctx, store)
 	if err != nil {
 		logger.Errorf("failed to get latest set of snapshot: %v", err)
 		return err
@@ -127,7 +128,7 @@ func (e *EtcdInitializer) restoreCorruptData() error {
 	}
 
 	rs := restorer.NewRestorer(store, logger)
-	if err := rs.Restore(tempRestoreOptions); err != nil {
+	if err := rs.Restore(ctx, tempRestoreOptions); err != nil {
 		err = fmt.Errorf("Failed to restore snapshot: %v", err)
 		return err
 	}

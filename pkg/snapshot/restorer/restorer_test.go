@@ -25,6 +25,7 @@ import (
 	"github.com/coreos/etcd/pkg/types"
 	"github.com/gardener/etcd-backup-restore/pkg/miscellaneous"
 	"github.com/gardener/etcd-backup-restore/pkg/snapstore"
+	"github.com/gardener/etcd-backup-restore/test/utils"
 
 	. "github.com/gardener/etcd-backup-restore/pkg/snapshot/restorer"
 	. "github.com/onsi/ginkgo"
@@ -34,8 +35,6 @@ import (
 
 var _ = Describe("Running Restorer", func() {
 	var (
-		logger *logrus.Logger
-
 		store snapstore.SnapStore
 		rstr  *Restorer
 
@@ -57,7 +56,6 @@ var _ = Describe("Running Restorer", func() {
 	BeforeEach(func() {
 		fmt.Println("Initializing snapstore and restorer")
 
-		logger = logrus.New()
 		restoreDataDir = etcdDir
 		restoreClusterToken = "etcd-cluster"
 		restoreName = "default"
@@ -80,7 +78,7 @@ var _ = Describe("Running Restorer", func() {
 		baseSnapshot, deltaSnapList, err = miscellaneous.GetLatestFullSnapshotAndDeltaSnapList(store)
 		Expect(err).ShouldNot(HaveOccurred())
 
-		rstr = NewRestorer(store, logger)
+		rstr = NewRestorer(store, logger.Logger)
 	})
 
 	Context("with zero fetchers", func() {
@@ -125,7 +123,7 @@ var _ = Describe("Running Restorer", func() {
 			err = rstr.Restore(restoreOptions)
 			Expect(err).ShouldNot(HaveOccurred())
 
-			err = checkDataConsistency(restoreDataDir, logger)
+			err = checkDataConsistency(testCtx, restoreDataDir, logger)
 			Expect(err).ShouldNot(HaveOccurred())
 		})
 	})
@@ -150,7 +148,7 @@ var _ = Describe("Running Restorer", func() {
 			err = rstr.Restore(restoreOptions)
 			Expect(err).ShouldNot(HaveOccurred())
 
-			err = checkDataConsistency(restoreDataDir, logger)
+			err = checkDataConsistency(testCtx, restoreDataDir, logger)
 			Expect(err).ShouldNot(HaveOccurred())
 		})
 	})
@@ -175,15 +173,15 @@ var _ = Describe("Running Restorer", func() {
 			err = rstr.Restore(restoreOptions)
 			Expect(err).ShouldNot(HaveOccurred())
 
-			err = checkDataConsistency(restoreDataDir, logger)
+			err = checkDataConsistency(testCtx, restoreDataDir, logger)
 			Expect(err).ShouldNot(HaveOccurred())
 		})
 	})
 })
 
 // checkDataConsistency starts an embedded etcd and checks for correctness of the values stored in etcd against the keys 'keyFrom' through 'keyTo'
-func checkDataConsistency(dir string, logger *logrus.Logger) error {
-	etcd, err := startEmbeddedEtcd(dir, logger)
+func checkDataConsistency(ctx context.Context, dir string, logger *logrus.Entry) error {
+	etcd, err := utils.StartEmbeddedEtcd(ctx, dir, logger)
 	if err != nil {
 		return fmt.Errorf("unable to start embedded etcd server: %v", err)
 	}
@@ -212,11 +210,11 @@ func checkDataConsistency(dir string, logger *logrus.Logger) error {
 		clientv3.WithLimit(1),
 	}
 
-	for currKey := keyFrom; currKey <= keyTo; currKey++ {
-		key = keyPrefix + strconv.Itoa(currKey)
-		value = valuePrefix + strconv.Itoa(currKey)
+	for currKey := 0; currKey <= keyTo; currKey++ {
+		key = utils.KeyPrefix + strconv.Itoa(currKey)
+		value = utils.ValuePrefix + strconv.Itoa(currKey)
 
-		resp, err := cli.Get(context.TODO(), key, opts...)
+		resp, err := cli.Get(testCtx, key, opts...)
 		if err != nil {
 			return fmt.Errorf("unable to get value from etcd: %v", err)
 		}
@@ -233,7 +231,7 @@ func checkDataConsistency(dir string, logger *logrus.Logger) error {
 			return fmt.Errorf("invalid etcd data - value mismatch for %s and %s", resValue, value)
 		}
 	}
-	fmt.Printf("Data consistency for key-value pairs (%[1]s%[3]d, %[2]s%[3]d) through (%[1]s%[4]d, %[2]s%[4]d) has been verified\n", keyPrefix, valuePrefix, keyFrom, keyTo)
+	fmt.Printf("Data consistency for key-value pairs (%[1]s%[3]d, %[2]s%[3]d) through (%[1]s%[4]d, %[2]s%[4]d) has been verified\n", utils.KeyPrefix, utils.ValuePrefix, 0, keyTo)
 
 	return nil
 }

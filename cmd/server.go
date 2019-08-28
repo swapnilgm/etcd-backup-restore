@@ -22,6 +22,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/sirupsen/logrus"
+
 	"github.com/coreos/etcd/pkg/types"
 	"github.com/gardener/etcd-backup-restore/pkg/errors"
 	"github.com/gardener/etcd-backup-restore/pkg/etcdutil"
@@ -30,11 +32,12 @@ import (
 	"github.com/gardener/etcd-backup-restore/pkg/snapshot/restorer"
 	"github.com/gardener/etcd-backup-restore/pkg/snapshot/snapshotter"
 	"github.com/gardener/etcd-backup-restore/pkg/snapstore"
+	cron "github.com/robfig/cron/v3"
 	"github.com/spf13/cobra"
 )
 
 // NewServerCommand create cobra command for snapshot
-func NewServerCommand(stopCh <-chan struct{}) *cobra.Command {
+func NewServerCommand(ctx context.Context) *cobra.Command {
 	var serverCmd = &cobra.Command{
 		Use:   "server",
 		Short: "start the http server with backup scheduler.",
@@ -104,7 +107,7 @@ func NewServerCommand(stopCh <-chan struct{}) *cobra.Command {
 				logger.Infof("Created snapstore from provider: %s", storageProvider)
 
 				snapshotterConfig, err := snapshotter.NewSnapshotterConfig(
-					schedule,
+					fullSnapshotSchedule,
 					ss,
 					maxBackups,
 					deltaSnapshotIntervalSeconds,
@@ -127,23 +130,35 @@ func NewServerCommand(stopCh <-chan struct{}) *cobra.Command {
 				defer handler.Stop()
 
 				ssrStopCh = make(chan struct{})
-				go handleSsrStopRequest(handler, ssr, ackCh, ssrStopCh, stopCh)
+				go handleSsrStopRequest(handler, ssr, ackCh, ssrStopCh, ctx.Done())
 				go handleAckState(handler, ackCh)
-				startDefragmentationThread(defragmentationPeriodHours, stopCh, tlsConfig, ssr.TriggerFullSnapshot)
-				runEtcdProbeLoopWithSnapshotter(tlsConfig, handler, ssr, ssrStopCh, stopCh, ackCh)
-			} else {
-				// If no storage provider is given, snapshotter will be nil, in which
-				// case the status is set to OK as soon as etcd probe is successful
-				handler = startHTTPServer(etcdInitializer, nil)
-				defer handler.Stop()
 
-				// start defragmentation without trigerring full snapshot
-				// after each successful data defragmentation
-				startDefragmentationThread(defragmentationPeriodHours, stopCh, tlsConfig, func() error {
-					return nil
-				})
-				runEtcdProbeLoopWithoutSnapshotter(tlsConfig, handler, stopCh, ackCh)
+				defragSchedule, err := cron.ParseStandard(defragmentationSchedule)
+				if err != nil {
+					logger.Fatalf("failed to parse defragmentation schedule: %v", err)
+					return
+				}
+				go etcdutil.DefragDataPeriodically(ctx, tlsConfig, defragSchedule, time.Duration(etcdConnectionTimeout)*time.Second, ssr.TriggerFullSnapshot, logrus.NewEntry(logger))
+
+				runEtcdProbeLoopWithSnapshotter(tlsConfig, handler, ssr, ssrStopCh, ctx.Done(), ackCh)
+				return
 			}
+			// If no storage provider is given, snapshotter will be nil, in which
+			// case the status is set to OK as soon as etcd probe is successful
+			handler = startHTTPServer(etcdInitializer, nil)
+			defer handler.Stop()
+
+			// start defragmentation without trigerring full snapshot
+			// after each successful data defragmentation
+			defragSchedule, err := cron.ParseStandard(defragmentationSchedule)
+			if err != nil {
+				logger.Fatalf("failed to parse defragmentation schedule: %v", err)
+				return
+			}
+			go etcdutil.DefragDataPeriodically(ctx, tlsConfig, defragSchedule, time.Duration(etcdConnectionTimeout)*time.Second, nil, logrus.NewEntry(logger))
+
+			runEtcdProbeLoopWithoutSnapshotter(tlsConfig, handler, ctx.Done(), ackCh)
+
 		},
 	}
 
@@ -176,15 +191,6 @@ func startHTTPServer(initializer initializer.Initializer, ssr *snapshotter.Snaps
 	go handler.Start()
 
 	return handler
-}
-
-// startDefragmentationThread starts the etcd data defragmentation thread
-func startDefragmentationThread(defragPeriod int, stopCh <-chan struct{}, tlsConfig *etcdutil.TLSConfig, triggerFullSnapshotCallback func() error) {
-	if defragPeriod < 1 {
-		logger.Infof("Disabling defragmentation since defragmentation period [%d] is less than 1", defragPeriod)
-		return
-	}
-	go etcdutil.DefragDataPeriodically(stopCh, tlsConfig, time.Duration(defragPeriod)*time.Hour, time.Duration(etcdConnectionTimeout)*time.Second, triggerFullSnapshotCallback)
 }
 
 // runEtcdProbeLoopWithoutSnapshotter runs the etcd probe loop

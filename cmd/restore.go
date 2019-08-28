@@ -15,6 +15,7 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"path"
 
@@ -27,7 +28,7 @@ import (
 )
 
 // NewRestoreCommand returns the command to restore
-func NewRestoreCommand(stopCh <-chan struct{}) *cobra.Command {
+func NewRestoreCommand(ctx context.Context) *cobra.Command {
 
 	// restoreCmd represents the restore command
 	restoreCmd := &cobra.Command{

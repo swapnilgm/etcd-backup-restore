@@ -59,9 +59,10 @@ type Snapshotter struct {
 	store                snapstore.SnapStore
 	config               *Config
 
-	schedule           cron.Schedule
-	prevSnapshot       *snapstore.Snapshot
-	PrevFullSnapshot   *snapstore.Snapshot
+	schedule         cron.Schedule
+	prevSnapshot     *snapstore.Snapshot
+	PrevFullSnapshot *snapstore.Snapshot
+
 	fullSnapshotReqCh  chan struct{}
 	deltaSnapshotReqCh chan struct{}
 	fullSnapshotAckCh  chan error

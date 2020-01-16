@@ -146,21 +146,21 @@ func (b *BackupRestoreServer) runServerWithSnapshotter(ctx context.Context, rest
 		return fmt.Errorf("failed to create snapstore from configured storage provider: %v", err)
 	}
 
-	ssr, _ := snapshotter.NewSnapshotter(b.logger, b.config.SnapshotterConfig, ss, b.config.EtcdConnectionConfig)
+	ssr, _ := snapshotter.NewSnapshotter(ctx, b.logger, b.config.SnapshotterConfig, ss, b.config.EtcdConnectionConfig)
 
 	handler := b.startHTTPServer(etcdInitializer, ssr)
 	defer handler.Stop()
 
-	ssrStopCh := make(chan struct{})
+	ssrCtx, cancelSsr := context.WithCancel(ctx)
 	leStopCh := make(chan struct{})
-	go handleSsrStopRequest(ctx, handler, leStopCh, ssrStopCh)
+	go handleSsrStopRequest(ctx, handler, leStopCh, cancelSsr)
 	go defragmentor.DefragDataPeriodically(ctx, b.config.EtcdConnectionConfig, b.defragmentationSchedule, ssr.TriggerFullSnapshot, b.logger)
 
 	leaderCallbacks := &leaderelection.LeaderCallbacks{
 		OnStartedLeading: func(ctx context.Context) {
 			b.logger.Infof("Started leading...")
-			handler.Snapshotter.LoadPreviousSnapshotState()
-			b.runEtcdProbeLoopWithSnapshotter(ctx, handler, ssr, ssrStopCh)
+			handler.Snapshotter.LoadPreviousSnapshotState(ctx)
+			b.runEtcdProbeLoopWithSnapshotter(ctx, ssrCtx, handler, ssr)
 		},
 		OnStoppedLeading: func() {
 			b.logger.Infof("Stopped leading...")
@@ -176,7 +176,7 @@ func (b *BackupRestoreServer) runServerWithSnapshotter(ctx context.Context, rest
 
 // runEtcdProbeLoopWithSnapshotter runs the etcd probe loop
 // for the case where snapshotter is configured correctly
-func (b *BackupRestoreServer) runEtcdProbeLoopWithSnapshotter(ctx context.Context, handler *HTTPHandler, ssr *snapshotter.Snapshotter, ssrStopCh <-chan struct{}) {
+func (b *BackupRestoreServer) runEtcdProbeLoopWithSnapshotter(ctx, ssrCtx context.Context, handler *HTTPHandler, ssr *snapshotter.Snapshotter) {
 	var (
 		err                       error
 		initialDeltaSnapshotTaken bool
@@ -213,7 +213,7 @@ func (b *BackupRestoreServer) runEtcdProbeLoopWithSnapshotter(ctx context.Contex
 		// supposed to be, according to the given cron schedule, instead of the
 		// hard-coded "24 hours" full snapshot interval
 		if ssr.PrevFullSnapshot != nil && time.Since(ssr.PrevFullSnapshot.CreatedOn).Hours() <= 24 {
-			ssrStopped, err := ssr.CollectEventsSincePrevSnapshot(ssrStopCh)
+			ssrStopped, err := ssr.CollectEventsSincePrevSnapshot(ssrCtx)
 			if ssrStopped {
 				b.logger.Info("Snapshotter stopped.")
 				handler.Acknowledge()
@@ -222,7 +222,7 @@ func (b *BackupRestoreServer) runEtcdProbeLoopWithSnapshotter(ctx context.Contex
 				return
 			}
 			if err == nil {
-				if err := ssr.TakeDeltaSnapshot(); err != nil {
+				if err := ssr.TakeDeltaSnapshot(ssrCtx); err != nil {
 					b.logger.Warnf("Failed to take first delta snapshot: snapshotter failed with error: %v", err)
 					continue
 				}
@@ -235,7 +235,7 @@ func (b *BackupRestoreServer) runEtcdProbeLoopWithSnapshotter(ctx context.Contex
 			// need to take a full snapshot here
 			metrics.SnapshotRequired.With(prometheus.Labels{metrics.LabelKind: snapstore.SnapshotKindDelta}).Set(0)
 			metrics.SnapshotRequired.With(prometheus.Labels{metrics.LabelKind: snapstore.SnapshotKindFull}).Set(1)
-			if err := ssr.TakeFullSnapshotAndResetTimer(); err != nil {
+			if err := ssr.TakeFullSnapshotAndResetTimer(ssrCtx); err != nil {
 				b.logger.Errorf("Failed to take substitute first full snapshot: %v", err)
 				continue
 			}
@@ -248,10 +248,10 @@ func (b *BackupRestoreServer) runEtcdProbeLoopWithSnapshotter(ctx context.Contex
 		ssr.SsrStateMutex.Lock()
 		ssr.SsrState = snapshotter.SnapshotterActive
 		ssr.SsrStateMutex.Unlock()
-		gcStopCh := make(chan struct{})
-		go ssr.RunGarbageCollector(gcStopCh)
+		gcCtx, gcCancel := context.WithCancel(ctx)
+		go ssr.RunGarbageCollector(gcCtx)
 		b.logger.Infof("Starting snapshotter...")
-		if err := ssr.Run(ssrStopCh, initialDeltaSnapshotTaken); err != nil {
+		if err := ssr.Run(ssrCtx, initialDeltaSnapshotTaken); err != nil {
 			if etcdErr, ok := err.(*errors.EtcdError); ok == true {
 				b.logger.Errorf("Snapshotter failed with etcd error: %v", etcdErr)
 			} else {
@@ -261,7 +261,7 @@ func (b *BackupRestoreServer) runEtcdProbeLoopWithSnapshotter(ctx context.Contex
 		b.logger.Infof("Snapshotter stopped.")
 		handler.Acknowledge()
 		handler.SetStatus(http.StatusServiceUnavailable)
-		close(gcStopCh)
+		gcCancel()
 	}
 }
 
@@ -326,7 +326,7 @@ func (b *BackupRestoreServer) probeEtcd(ctx context.Context) error {
 }
 
 // handleSsrStopRequest responds to handlers request and stop interrupt.
-func handleSsrStopRequest(ctx context.Context, handler *HTTPHandler, leStopCh <-chan struct{}, ssrStopCh chan<- struct{}) {
+func handleSsrStopRequest(ctx context.Context, handler *HTTPHandler, leStopCh <-chan struct{}, cancelSsr func()) {
 	for {
 		var ok bool
 		select {
@@ -339,7 +339,7 @@ func handleSsrStopRequest(ctx context.Context, handler *HTTPHandler, leStopCh <-
 		if handler.Snapshotter.SsrState == snapshotter.SnapshotterActive {
 			handler.Snapshotter.SsrStateMutex.Unlock()
 			handler.Logger.Infof("Sending stop signal to ssr ")
-			ssrStopCh <- emptyStruct
+			cancelSsr()
 		} else {
 			handler.Snapshotter.SsrState = snapshotter.SnapshotterInactive
 			handler.Snapshotter.SsrStateMutex.Unlock()
